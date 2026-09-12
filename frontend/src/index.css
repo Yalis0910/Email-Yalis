@@ -1,0 +1,209 @@
+@import "tailwindcss";
+
+@layer theme {
+  :root {
+    --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", Georgia, Cambria, serif;
+    --font-sans: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+    --font-mono: "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas, monospace;
+    
+    /* Yohaku Palette: Light (Warm Paper / 和纸) */
+    --color-paper: #faf9f5;
+    --color-surface: #ffffff;
+    --color-surface-subtle: #f4f3ed;
+    --color-accent: #c56473; /* Signature Yohaku dusty rose / vermilion */
+    --color-accent-soft: rgba(197, 100, 115, 0.08);
+    --color-accent-border: rgba(197, 100, 115, 0.28);
+
+    --color-neutral-1: #f9f8f5;
+    --color-neutral-2: #f0efeb;
+    --color-neutral-3: #e3e1db;
+    --color-neutral-4: #d0cec6;
+    --color-neutral-5: #a8a69f;
+    --color-neutral-6: #787670;
+    --color-neutral-7: #5c5a55;
+    --color-neutral-8: #403f3a;
+    --color-neutral-9: #24231f;
+    --color-neutral-10: #141312;
+
+    --color-border: rgba(24, 24, 27, 0.08);
+    --color-border-hover: rgba(24, 24, 27, 0.16);
+
+    --field-bg: #ffffff;
+    --field-border: rgba(24, 24, 27, 0.1);
+    --field-focus-ring: rgba(197, 100, 115, 0.15);
+
+    --shadow-yohaku: 0 1px 3px rgba(0, 0, 0, 0.03), 0 4px 12px rgba(0, 0, 0, 0.02);
+    --shadow-yohaku-hover: 0 4px 16px rgba(0, 0, 0, 0.06);
+  }
+
+  [data-theme="dark"] {
+    /* Yohaku Palette: Dark (Matte Charcoal / 墨色) */
+    --color-paper: #161618;
+    --color-surface: #1e1e21;
+    --color-surface-subtle: #252529;
+    --color-accent: #d87887;
+    --color-accent-soft: rgba(216, 120, 135, 0.12);
+    --color-accent-border: rgba(216, 120, 135, 0.35);
+
+    --color-neutral-1: #141312;
+    --color-neutral-2: #24231f;
+    --color-neutral-3: #3b3a36;
+    --color-neutral-4: #54524c;
+    --color-neutral-5: #787670;
+    --color-neutral-6: #a8a69f;
+    --color-neutral-7: #c9c7bf;
+    --color-neutral-8: #dedcd4;
+    --color-neutral-9: #f0efeb;
+    --color-neutral-10: #faf9f5;
+
+    --color-border: rgba(255, 255, 255, 0.08);
+    --color-border-hover: rgba(255, 255, 255, 0.18);
+
+    --field-bg: #1e1e21;
+    --field-border: rgba(255, 255, 255, 0.1);
+    --field-focus-ring: rgba(216, 120, 135, 0.2);
+
+    --shadow-yohaku: 0 1px 3px rgba(0, 0, 0, 0.2), 0 4px 14px rgba(0, 0, 0, 0.25);
+    --shadow-yohaku-hover: 0 6px 20px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+  position: relative;
+  background-color: var(--color-paper);
+  color: var(--color-neutral-9);
+  font-family: var(--font-sans);
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+#root {
+  min-height: 100vh;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+.font-serif {
+  font-family: var(--font-serif);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Yohaku Specific Component Classes */
+.yohaku-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-yohaku);
+  border-radius: 12px;
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), 
+              box-shadow 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+              border-color 0.2s ease;
+}
+
+.yohaku-card:hover {
+  border-color: var(--color-border-hover);
+  box-shadow: var(--shadow-yohaku-hover);
+}
+
+.yohaku-btn-primary {
+  background-color: var(--color-accent-soft);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-border);
+  border-radius: 8px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+
+.yohaku-btn-primary:hover {
+  background-color: var(--color-accent);
+  color: #ffffff;
+}
+
+.yohaku-btn-secondary {
+  background-color: transparent;
+  color: var(--color-neutral-8);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+
+.yohaku-btn-secondary:hover {
+  background-color: var(--color-surface-subtle);
+  border-color: var(--color-border-hover);
+  color: var(--color-neutral-10);
+}
+
+.yohaku-tag {
+  background-color: var(--color-surface-subtle);
+  color: var(--color-neutral-7);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+}
+
+.yohaku-tag-accent {
+  background-color: var(--color-accent-soft);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-border);
+  border-radius: 6px;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+}
+
+/* Minimalist Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-4);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-5);
+}
+
+/* Global Subtle Text Selection */
+::selection {
+  background-color: rgba(197, 100, 115, 0.22);
+  color: inherit;
+}
+
+/* User Message Bubble: High contrast inverted selection to prevent pink-on-pink clash */
+.user-message-bubble,
+.user-message-bubble * {
+  &::selection {
+    background-color: #ffffff !important;
+    color: #141312 !important;
+  }
+}
+

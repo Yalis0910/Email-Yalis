@@ -35,6 +35,34 @@ PROVIDER_DEFAULTS = {
     "custom": {"host": "", "port": 993, "ssl": True}
 }
 
+# Stop events registry for active IMAP background sync workers
+IMAP_STOP_EVENTS: Dict[str, threading.Event] = {}
+
+def get_or_create_stop_event(account_id: str) -> threading.Event:
+    if account_id not in IMAP_STOP_EVENTS:
+        IMAP_STOP_EVENTS[account_id] = threading.Event()
+    return IMAP_STOP_EVENTS[account_id]
+
+def signal_stop_sync(account_id: str):
+    if account_id in IMAP_STOP_EVENTS:
+        IMAP_STOP_EVENTS[account_id].set()
+
+def safe_imap_logout(mail: Any):
+    """
+    Safely logs out and shuts down the underlying socket of an IMAP4 connection,
+    ensuring zero connection leaks even when the remote server is unresponsive or errors out.
+    """
+    if not mail:
+        return
+    try:
+        mail.logout()
+    except Exception:
+        try:
+            if hasattr(mail, "sock") and mail.sock:
+                mail.sock.close()
+        except Exception:
+            pass
+
 class GenericImapService:
     @staticmethod
     def _decode_str(raw_header: str) -> str:
@@ -61,6 +89,63 @@ class GenericImapService:
             return match.group(1).strip('"\' '), match.group(2).strip().lower()
         return "", raw_str.strip().lower()
 
+    @staticmethod
+    def _unpack_corrupted_multipart(raw_text: str) -> Tuple[str, str]:
+        """
+        If a message was stored or parsed as a raw MIME multipart string (e.g. starting with --boundary),
+        extract clean text/plain and text/html, decoding Quoted-Printable / Base64.
+        """
+        if not raw_text:
+            return "", ""
+        stripped = raw_text.lstrip()
+        if not stripped.startswith("--"):
+            return raw_text, ""
+
+        first_line = stripped.splitlines()[0].strip()
+        # MIME boundary lines start with '--' followed by the boundary identifier
+        boundary = first_line[2:].strip()
+        if not boundary:
+            return raw_text, ""
+
+        fake_mime = f'Content-Type: multipart/mixed; boundary="{boundary}"\r\n\r\n' + stripped
+        try:
+            from email import policy
+            inner_msg = email.message_from_string(fake_mime, policy=policy.default)
+        except Exception:
+            inner_msg = email.message_from_string(fake_mime)
+
+        extracted_text = ""
+        extracted_html = ""
+        for part in inner_msg.walk():
+            ct = part.get_content_type()
+            disp = str(part.get("Content-Disposition", ""))
+            if "attachment" in disp:
+                continue
+            try:
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                decoded = payload.decode(charset, errors="replace")
+                if ct == "text/plain" and not extracted_text:
+                    extracted_text = decoded
+                elif ct == "text/html" and not extracted_html:
+                    extracted_html = decoded
+            except Exception:
+                pass
+
+        if not extracted_text and extracted_html:
+            try:
+                soup = BeautifulSoup(extracted_html, "html.parser")
+                extracted_text = soup.get_text(separator="\n", strip=True)
+            except Exception:
+                extracted_text = extracted_html[:1000]
+
+        if extracted_text or extracted_html:
+            return extracted_text, extracted_html
+        return raw_text, ""
+
+
     @classmethod
     def test_connection(
         cls,
@@ -74,17 +159,16 @@ class GenericImapService:
         target_host = host.strip() or "imap.gmail.com"
         target_port = int(port or 993)
 
-        if use_ssl:
-            mail = imaplib.IMAP4_SSL(target_host, target_port, timeout=20)
-        else:
-            mail = imaplib.IMAP4(target_host, target_port, timeout=20)
-
+        mail = None
         try:
+            if use_ssl:
+                mail = imaplib.IMAP4_SSL(target_host, target_port, timeout=20)
+            else:
+                mail = imaplib.IMAP4(target_host, target_port, timeout=20)
             mail.login(email_addr, clean_pwd)
-            mail.logout()
             return True
-        except Exception as e:
-            raise e
+        finally:
+            safe_imap_logout(mail)
 
     @classmethod
     async def save_imap_account(
@@ -243,9 +327,22 @@ class GenericImapService:
                 port = row["imap_port"] or PROVIDER_DEFAULTS.get(provider, {}).get("port", 993)
                 use_ssl = bool(row["use_ssl"] if row["use_ssl"] is not None else True)
 
+        is_gmail = (
+            "gmail" in host.lower()
+            or provider.lower() == "gmail"
+            or "@gmail.com" in email_addr.lower()
+            or "google" in host.lower()
+        )
+
         loop = asyncio.get_event_loop()
 
         def worker_sync():
+            # Circuit breaker to immediately abort further requests if stop is requested or rate limit detected
+            stop_event = get_or_create_stop_event(account_id)
+            stop_event.clear()
+            rate_limit_detected = [False]
+            rate_limit_msg = [""]
+
             # 1. Fetch existing message IDs from local database
             con_check = sqlite3.connect(DB_PATH, timeout=30.0)
             cur_check = con_check.cursor()
@@ -253,317 +350,443 @@ class GenericImapService:
             existing_ids = set(r[0] for r in cur_check.fetchall())
             con_check.close()
 
-            if use_ssl:
-                mail = imaplib.IMAP4_SSL(host, port, timeout=35)
-            else:
-                mail = imaplib.IMAP4(host, port, timeout=35)
+            mail = None
+            worker_pool_conns = []
+            pool_lock = threading.Lock()
 
-            mail.login(email_addr, app_pwd)
+            try:
+                if use_ssl:
+                    mail = imaplib.IMAP4_SSL(host, port, timeout=35)
+                else:
+                    mail = imaplib.IMAP4(host, port, timeout=35)
 
-            # Discover folders automatically
-            target_folders, sent_folder_names = cls._discover_folders(mail)
-
-            folder_map = {}
-            for folder in target_folders:
-                folder_arg = folder if (folder.startswith('"') and folder.endswith('"')) else f'"{folder}"'
                 try:
-                    st, _ = mail.select(folder_arg, readonly=True)
-                    if st == "OK":
-                        st_search, msg_nums = mail.search(None, "ALL")
-                        if st_search == "OK" and msg_nums and msg_nums[0]:
-                            nums = msg_nums[0].split()
-                            nums.reverse()
-                            if max_results:
-                                nums = nums[:max_results]
-                            folder_map[folder] = nums
-                except Exception:
-                    continue
+                    mail.login(email_addr, app_pwd)
+                except Exception as e:
+                    err_lower = str(e).lower()
+                    if "exceeded command or bandwidth limits" in err_lower:
+                        raise RuntimeError("Account exceeded command or bandwidth limits")
+                    if "too many simultaneous" in err_lower:
+                        raise RuntimeError("Gmail [ALERT] Too many simultaneous connections")
+                    raise e
 
-            total_found = sum(len(n) for n in folder_map.values())
-            if total_found == 0:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
-                return 0, 0
+                # Discover folders automatically
+                target_folders, sent_folder_names = cls._discover_folders(mail)
 
-            # 2. Fast Header Pre-check Filter: only download what's NOT in local DB
-            tasks = []
-            seen_in_this_run = set()
-
-            if not full_sync and len(existing_ids) > 0:
-                asyncio.run_coroutine_threadsafe(
-                    notify_progress(account_id, "syncing", 0, total_found, f"正在快速比对 {total_found} 封邮件报头，过滤已有数据..."),
-                    loop
-                )
-                for folder, nums in folder_map.items():
+                folder_map = {}
+                for folder in target_folders:
+                    if stop_event.is_set():
+                        break
                     folder_arg = folder if (folder.startswith('"') and folder.endswith('"')) else f'"{folder}"'
                     try:
-                        mail.select(folder_arg, readonly=True)
+                        st, _ = mail.select(folder_arg, readonly=True)
+                        if st == "OK":
+                            st_search, msg_nums = mail.search(None, "ALL")
+                            if st_search == "OK" and msg_nums and msg_nums[0]:
+                                nums = msg_nums[0].split()
+                                nums.reverse()
+                                if max_results:
+                                    nums = nums[:max_results]
+                                folder_map[folder] = nums
                     except Exception:
                         continue
 
-                    chunk_size = 150
-                    for i in range(0, len(nums), chunk_size):
-                        chunk = nums[i:i + chunk_size]
-                        num_str = b",".join(chunk).decode()
-                        try:
-                            st, data = mail.fetch(num_str, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-                            if st == "OK" and data:
-                                for item in data:
-                                    if isinstance(item, tuple) and len(item) >= 2:
-                                        header_prefix = item[0].decode('utf-8', errors='ignore')
-                                        m_num = re.search(r'^(\d+)\s+', header_prefix)
-                                        num_val = m_num.group(1).encode() if m_num else None
+                total_found = sum(len(n) for n in folder_map.values())
+                if total_found == 0 or stop_event.is_set():
+                    return total_found, 0, False, 0
 
-                                        raw_header = item[1].decode('utf-8', errors='ignore')
-                                        m = re.search(r'Message-ID:\s*<([^>]+)>', raw_header, re.IGNORECASE)
-                                        msg_id = m.group(1).strip() if m else None
-                                        if not msg_id:
-                                            m2 = re.search(r'Message-ID:\s*(.+)', raw_header, re.IGNORECASE)
-                                            msg_id = m2.group(1).strip() if m2 else None
+                # 2. Fast Header Pre-check Filter: only download what's NOT in local DB
+                tasks = []
+                seen_in_this_run = set()
+                GMAIL_BATCH_LIMIT = 250
+                target_batch_cap = max_results if max_results else (GMAIL_BATCH_LIMIT if is_gmail else None)
 
-                                        if num_val:
-                                            if not msg_id or (msg_id not in existing_ids and msg_id not in seen_in_this_run):
-                                                if msg_id:
-                                                    seen_in_this_run.add(msg_id)
-                                                tasks.append((folder, num_val))
-                        except Exception:
-                            # Fallback if header fetch fails
-                            for n in chunk:
-                                tasks.append((folder, n))
-            else:
-                for folder, nums in folder_map.items():
-                    for n in nums:
-                        tasks.append((folder, n))
-
-            new_msgs_count = len(tasks)
-            if new_msgs_count == 0:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
-                return total_found, 0
-
-            asyncio.run_coroutine_threadsafe(
-                notify_progress(account_id, "syncing", 0, new_msgs_count, f"共发现 {new_msgs_count} 封新增邮件，开始批量高速拉取与解析..."),
-                loop
-            )
-
-            chunk_size = 10
-            chunks = [tasks[i:i + chunk_size] for i in range(0, new_msgs_count, chunk_size)]
-            max_workers = min(4, max(1, len(chunks)))
-
-            # Thread-local storage for persistent worker IMAP connections
-            tls = threading.local()
-
-            def get_worker_mail():
-                if not hasattr(tls, "mail") or tls.mail is None:
-                    try:
-                        if use_ssl:
-                            m = imaplib.IMAP4_SSL(host, port, timeout=25)
-                        else:
-                            m = imaplib.IMAP4(host, port, timeout=25)
-                        m.login(email_addr, app_pwd)
-                        tls.mail = m
-                        tls.curr_folder = None
-                    except Exception:
-                        tls.mail = None
-                        tls.curr_folder = None
-                return tls.mail
-
-            def cleanup_worker_mail():
-                if hasattr(tls, "mail") and tls.mail:
-                    try:
-                        tls.mail.logout()
-                    except Exception:
-                        pass
-                    tls.mail = None
-                    tls.curr_folder = None
-
-            def fetch_single_chunk(chunk_tuples):
-                """
-                Worker task executed in thread pool.
-                Takes a chunk of (folder, num) tuples and fetches messages smartly:
-                - Normal emails (<=1MB) are batch-fetched in 1 IMAP command.
-                - Large emails (>1MB, heavy designs) are fetched lightweight (headers + body text + structure) in ~1s
-                  without streaming multi-megabyte image payloads across the proxy.
-                """
-                m = get_worker_mail()
-                if not m:
-                    return []
-
-                # Group numbers by folder
-                folder_to_nums = {}
-                for f, n in chunk_tuples:
-                    folder_to_nums.setdefault(f, []).append(n)
-
-                chunk_items = []
-                for folder, nums in folder_to_nums.items():
-                    # Ensure folder is selected
-                    if getattr(tls, "curr_folder", None) != folder:
+                if not full_sync and len(existing_ids) > 0:
+                    asyncio.run_coroutine_threadsafe(
+                        notify_progress(account_id, "syncing", 0, total_found, f"正在快速比对 {total_found} 封邮件报头，过滤已有数据..."),
+                        loop
+                    )
+                    for folder, nums in folder_map.items():
+                        if stop_event.is_set():
+                            break
                         folder_arg = folder if (folder.startswith('"') and folder.endswith('"')) else f'"{folder}"'
                         try:
-                            st, _ = m.select(folder_arg, readonly=True)
-                            if st != "OK":
-                                continue
-                            tls.curr_folder = folder
+                            mail.select(folder_arg, readonly=True)
                         except Exception:
-                            cleanup_worker_mail()
-                            m = get_worker_mail()
-                            if not m:
-                                return []
+                            continue
+
+                        chunk_size = 100 if is_gmail else 150
+                        for i in range(0, len(nums), chunk_size):
+                            if stop_event.is_set():
+                                break
+                            # Stop pre-check early if we already have enough tasks for the current safe batch
+                            if target_batch_cap and len(tasks) >= target_batch_cap:
+                                break
+                            chunk = nums[i:i + chunk_size]
+                            num_str = b",".join(chunk).decode()
                             try:
-                                m.select(folder_arg, readonly=True)
-                                tls.curr_folder = folder
-                            except Exception:
+                                st, data = mail.fetch(num_str, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                                if st == "OK" and data:
+                                    for item in data:
+                                        if isinstance(item, tuple) and len(item) >= 2:
+                                            header_prefix = item[0].decode('utf-8', errors='ignore')
+                                            m_num = re.search(r'^(\d+)\s+', header_prefix)
+                                            num_val = m_num.group(1).encode() if m_num else None
+
+                                            raw_header = item[1].decode('utf-8', errors='ignore')
+                                            m = re.search(r'Message-ID:\s*<([^>]+)>', raw_header, re.IGNORECASE)
+                                            msg_id = m.group(1).strip() if m else None
+                                            if not msg_id:
+                                                m2 = re.search(r'Message-ID:\s*(.+)', raw_header, re.IGNORECASE)
+                                                msg_id = m2.group(1).strip() if m2 else None
+
+                                            if num_val:
+                                                if not msg_id or (msg_id not in existing_ids and msg_id not in seen_in_this_run):
+                                                    if msg_id:
+                                                        seen_in_this_run.add(msg_id)
+                                                    tasks.append((folder, num_val))
+                            except Exception as e:
+                                err_str = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_str:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                    break
+                                if "too many simultaneous" in err_str:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                    break
+                                # Fallback if header fetch fails
+                                for n in chunk:
+                                    tasks.append((folder, n))
+
+                            # Gentle pacing for Gmail to prevent burst command rate warnings
+                            if is_gmail:
+                                import time
+                                time.sleep(0.12)
+                        if target_batch_cap and len(tasks) >= target_batch_cap:
+                            break
+                else:
+                    for folder, nums in folder_map.items():
+                        for n in nums:
+                            tasks.append((folder, n))
+
+                if rate_limit_detected[0]:
+                    raise RuntimeError(rate_limit_msg[0] or "Account exceeded command or bandwidth limits")
+
+                if stop_event.is_set():
+                    return total_found, 0, False, 0
+
+                raw_new_msgs_count = len(tasks)
+                if raw_new_msgs_count == 0:
+                    return total_found, 0, False, 0
+
+                # Batch capping calculation
+                has_more_batch = False
+                total_pending_all = max(raw_new_msgs_count, max(0, total_found - len(existing_ids)))
+                if target_batch_cap and len(tasks) > target_batch_cap:
+                    tasks = tasks[:target_batch_cap]
+
+                new_msgs_count = len(tasks)
+                if total_pending_all > new_msgs_count:
+                    has_more_batch = True
+
+                if has_more_batch:
+                    start_msg = f"检测到共有约 {total_pending_all} 封待同步，采用防风控平稳模式拉取本批 {new_msgs_count} 封..."
+                else:
+                    start_msg = f"共发现 {new_msgs_count} 封新增邮件，开始批量稳定拉取与解析..."
+
+                asyncio.run_coroutine_threadsafe(
+                    notify_progress(account_id, "syncing", 0, new_msgs_count, start_msg),
+                    loop
+                )
+
+                chunk_size = 10
+                chunks = [tasks[i:i + chunk_size] for i in range(0, new_msgs_count, chunk_size)]
+
+                # Gmail: strictly 1 connection to prevent "Too many simultaneous connections" alerts
+                max_workers = 1 if is_gmail else min(4, max(1, len(chunks)))
+
+                # Threshold to switch to lightweight fetch:
+                # 128KB for Gmail: saves up to 90% bandwidth and prevents hourly/daily quota exhaustion;
+                # 1024KB for other generic providers.
+                raw_rfc822_threshold = 128 * 1024 if is_gmail else 1024 * 1024
+
+                def fetch_chunk_with_conn(conn, chunk_tuples, curr_folder_state):
+                    """
+                    Fetches messages smartly using the provided connection:
+                    - Normal emails (<= raw_rfc822_threshold) are batch-fetched in 1 IMAP command.
+                    - Large emails (> raw_rfc822_threshold) are fetched lightweight (headers + body text + structure)
+                      without streaming multi-megabyte image/file payloads.
+                    """
+                    if stop_event.is_set() or rate_limit_detected[0]:
+                        return []
+
+                    # Group numbers by folder
+                    folder_to_nums = {}
+                    for f, n in chunk_tuples:
+                        folder_to_nums.setdefault(f, []).append(n)
+
+                    chunk_items = []
+                    for folder, nums in folder_to_nums.items():
+                        if stop_event.is_set() or rate_limit_detected[0]:
+                            break
+
+                        # Ensure folder is selected
+                        if curr_folder_state.get("folder") != folder:
+                            folder_arg = folder if (folder.startswith('"') and folder.endswith('"')) else f'"{folder}"'
+                            try:
+                                st, _ = conn.select(folder_arg, readonly=True)
+                                if st != "OK":
+                                    continue
+                                curr_folder_state["folder"] = folder
+                            except Exception as e:
+                                err_s = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                    return []
                                 continue
 
-                    is_sent = (folder in sent_folder_names)
+                        is_sent = (folder in sent_folder_names)
 
-                    # 1. Quick size detection (takes ~0.2s for 10 emails)
-                    seq = b",".join(nums).decode()
-                    sizes = {}
-                    try:
-                        st_sz, sz_data = m.fetch(seq, "(RFC822.SIZE)")
-                        if st_sz == "OK" and sz_data:
-                            for item in sz_data:
-                                if isinstance(item, bytes):
-                                    t = item.decode('utf-8', errors='ignore')
-                                    m_sz = re.search(r'^(\d+)\s+.*RFC822\.SIZE\s+(\d+)', t)
-                                    if m_sz:
-                                        sizes[m_sz.group(1)] = int(m_sz.group(2))
-                    except Exception:
-                        cleanup_worker_mail()
+                        # 1. Quick size detection (takes ~0.2s for 10 emails)
+                        seq = b",".join(nums).decode()
+                        sizes = {}
+                        try:
+                            st_sz, sz_data = conn.fetch(seq, "(RFC822.SIZE)")
+                            if st_sz == "OK" and sz_data:
+                                for item in sz_data:
+                                    if isinstance(item, bytes):
+                                        t = item.decode('utf-8', errors='ignore')
+                                        m_sz = re.search(r'^(\d+)\s+.*RFC822\.SIZE\s+(\d+)', t)
+                                        if m_sz:
+                                            sizes[m_sz.group(1)] = int(m_sz.group(2))
+                        except Exception as e:
+                            err_s = str(e).lower()
+                            if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
+                                rate_limit_detected[0] = True
+                                rate_limit_msg[0] = str(e)
+                                stop_event.set()
+                                return []
+
+                        # Partition into small (<= raw_rfc822_threshold) and large (> raw_rfc822_threshold)
+                        small_nums = []
+                        large_nums = []
+                        for n in nums:
+                            n_str = n.decode() if isinstance(n, bytes) else str(n)
+                            if sizes.get(n_str, 0) > raw_rfc822_threshold:
+                                large_nums.append(n)
+                            else:
+                                small_nums.append(n)
+
+                        # 2. Batch fetch small emails in 1 fast command
+                        if small_nums:
+                            small_seq = b",".join(small_nums).decode()
+                            try:
+                                st, data = conn.fetch(small_seq, "(RFC822)")
+                                if st == "OK" and data:
+                                    for item in data:
+                                        if isinstance(item, tuple) and len(item) >= 2:
+                                            hp = item[0].decode('utf-8', errors='ignore')
+                                            m_n = re.search(r'^(\d+)\s+', hp)
+                                            nv = m_n.group(1) if m_n else ""
+                                            try:
+                                                msg = email.message_from_bytes(item[1])
+                                                chunk_items.append((nv, msg, folder, is_sent))
+                                            except Exception:
+                                                pass
+                            except Exception as e:
+                                err_s = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                    return []
+
+                        # 3. Lightweight fetch for large emails
+                        for ln in large_nums:
+                            if stop_event.is_set() or rate_limit_detected[0]:
+                                break
+                            ln_str = ln.decode() if isinstance(ln, bytes) else str(ln)
+                            try:
+                                st, l_data = conn.fetch(ln, "(BODY.PEEK[HEADER] BODYSTRUCTURE BODY.PEEK[1])")
+                                if st == "OK" and l_data:
+                                    hdr_raw = b""
+                                    body_raw = b""
+                                    bs_raw = ""
+                                    for item in l_data:
+                                        if isinstance(item, tuple) and len(item) >= 2:
+                                            pfx = item[0].decode('utf-8', errors='ignore')
+                                            if "HEADER" in pfx:
+                                                hdr_raw = item[1]
+                                            elif "BODY[1]" in pfx:
+                                                body_raw = item[1]
+                                            elif "BODYSTRUCTURE" in pfx:
+                                                bs_raw = item[0].decode('utf-8', errors='ignore')
+                                        elif isinstance(item, bytes):
+                                            if b"BODYSTRUCTURE" in item:
+                                                bs_raw = item.decode('utf-8', errors='ignore')
+
+                                    if hdr_raw:
+                                        if body_raw and body_raw.lstrip().startswith(b"--"):
+                                            first_line_raw = body_raw.lstrip().splitlines()[0].strip()
+                                            if first_line_raw.startswith(b"--"):
+                                                inner_boundary = first_line_raw[2:].strip()
+                                                hdr_raw = re.sub(
+                                                    rb'(?i)content-type:\s*multipart/[^;\r\n]+;[^\r\n]*boundary=([\"\']?)[^\r\n\"\']+\1',
+                                                    b'Content-Type: multipart/mixed; boundary="' + inner_boundary + b'"',
+                                                    hdr_raw
+                                                )
+                                        full_msg_raw = hdr_raw.rstrip() + b"\r\n\r\n" + (body_raw or b"")
+                                        msg = email.message_from_bytes(full_msg_raw)
+                                        matched_atts = re.findall(
+                                            r'"(?:BASE64|7BIT|8BIT|QUOTED-PRINTABLE)"\s+(\d+)\s+NIL\s+\("(?:INLINE|ATTACHMENT)"\s+\("FILENAME"\s+"([^"]+)"\)\)',
+                                            bs_raw, re.IGNORECASE
+                                        )
+                                        if not matched_atts:
+                                            fns = re.findall(r'"FILENAME"\s+"([^"]+)"', bs_raw, re.IGNORECASE)
+                                            matched_atts = [("0", f) for f in fns]
+
+                                        for sz_str, fn_str in matched_atts:
+                                            att_part = email.message.Message()
+                                            att_part["Content-Type"] = "application/octet-stream"
+                                            att_part["Content-Disposition"] = f'attachment; filename="{fn_str}"'
+                                            att_part.set_payload(b"")
+                                            try:
+                                                att_part._estimated_size = int(sz_str)
+                                            except Exception:
+                                                att_part._estimated_size = 0
+                                            msg.attach(att_part)
+
+                                        chunk_items.append((ln_str, msg, folder, is_sent))
+                            except Exception as e:
+                                err_s = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                    return []
+
+                    if is_gmail:
+                        import time
+                        time.sleep(0.5)
+
+                    return chunk_items
+
+                processed_count = 0
+
+                # If Gmail or single worker: reuse the existing authenticated `mail` connection directly!
+                # This guarantees EXACTLY 1 connection is ever created, fully immune to concurrency leaks.
+                if is_gmail or max_workers == 1:
+                    curr_folder_state = {"folder": None}
+                    for ch in chunks:
+                        if stop_event.is_set() or rate_limit_detected[0]:
+                            break
+                        fetched_items = fetch_chunk_with_conn(mail, ch, curr_folder_state)
+                        if fetched_items:
+                            cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                        processed_count += len(ch)
+                        curr_val = min(new_msgs_count, processed_count)
+                        pct = (curr_val * 100) // new_msgs_count
+                        asyncio.run_coroutine_threadsafe(
+                            notify_progress(
+                                account_id,
+                                "syncing",
+                                curr_val,
+                                new_msgs_count,
+                                f"正在平稳解析入库: {curr_val} / {new_msgs_count} 封 ({pct}%)"
+                            ),
+                            loop
+                        )
+                else:
+                    # Multi-worker pool for non-Gmail enterprise mail servers
+                    tls = threading.local()
+
+                    def get_worker_mail():
+                        if stop_event.is_set() or rate_limit_detected[0]:
+                            return None
+                        if not hasattr(tls, "mail") or tls.mail is None:
+                            try:
+                                m = imaplib.IMAP4_SSL(host, port, timeout=25) if use_ssl else imaplib.IMAP4(host, port, timeout=25)
+                                m.login(email_addr, app_pwd)
+                                tls.mail = m
+                                tls.curr_folder_state = {"folder": None}
+                                with pool_lock:
+                                    worker_pool_conns.append(m)
+                            except Exception as e:
+                                err_text = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_text or "too many simultaneous" in err_text:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
+                                tls.mail = None
+                        return tls.mail
+
+                    def pool_fetch_chunk(chunk_tuples):
                         m = get_worker_mail()
                         if not m:
                             return []
+                        return fetch_chunk_with_conn(m, chunk_tuples, tls.curr_folder_state)
 
-                    # Partition into small (<= 1MB) and large (> 1MB)
-                    small_nums = []
-                    large_nums = []
-                    for n in nums:
-                        n_str = n.decode() if isinstance(n, bytes) else str(n)
-                        if sizes.get(n_str, 0) > 1024 * 1024:
-                            large_nums.append(n)
-                        else:
-                            small_nums.append(n)
-
-                    # 2. Batch fetch small emails (<=1MB) in 1 fast command
-                    if small_nums:
-                        small_seq = b",".join(small_nums).decode()
-                        try:
-                            st, data = m.fetch(small_seq, "(RFC822)")
-                            if st == "OK" and data:
-                                for item in data:
-                                    if isinstance(item, tuple) and len(item) >= 2:
-                                        hp = item[0].decode('utf-8', errors='ignore')
-                                        m_n = re.search(r'^(\d+)\s+', hp)
-                                        nv = m_n.group(1) if m_n else ""
-                                        try:
-                                            msg = email.message_from_bytes(item[1])
-                                            chunk_items.append((nv, msg, folder, is_sent))
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            cleanup_worker_mail()
-                            m = get_worker_mail()
-
-                    # 3. Lightweight fetch for large emails (>1MB, avoids streaming 10~20MB image blobs)
-                    for ln in large_nums:
-                        ln_str = ln.decode() if isinstance(ln, bytes) else str(ln)
-                        try:
-                            if not m:
-                                m = get_worker_mail()
-                                if not m:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_chunk = {executor.submit(pool_fetch_chunk, ch): len(ch) for ch in chunks}
+                        for future in as_completed(future_to_chunk):
+                            if stop_event.is_set() or rate_limit_detected[0]:
+                                break
+                            chunk_len = future_to_chunk[future]
+                            try:
+                                fetched_items = future.result()
+                                if fetched_items:
+                                    cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                            except Exception as e:
+                                err_s = str(e).lower()
+                                if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
+                                    rate_limit_detected[0] = True
+                                    rate_limit_msg[0] = str(e)
+                                    stop_event.set()
                                     break
-                            st, l_data = m.fetch(ln, "(BODY.PEEK[HEADER] BODYSTRUCTURE BODY.PEEK[1])")
-                            if st == "OK" and l_data:
-                                hdr_raw = b""
-                                body_raw = b""
-                                bs_raw = ""
-                                for item in l_data:
-                                    if isinstance(item, tuple) and len(item) >= 2:
-                                        pfx = item[0].decode('utf-8', errors='ignore')
-                                        if "HEADER" in pfx:
-                                            hdr_raw = item[1]
-                                        elif "BODY[1]" in pfx:
-                                            body_raw = item[1]
-                                        elif "BODYSTRUCTURE" in pfx:
-                                            bs_raw = item[0].decode('utf-8', errors='ignore')
-                                    elif isinstance(item, bytes):
-                                        if b"BODYSTRUCTURE" in item:
-                                            bs_raw = item.decode('utf-8', errors='ignore')
 
-                                if hdr_raw:
-                                    full_msg_raw = hdr_raw.rstrip() + b"\r\n\r\n" + (body_raw or b"")
-                                    msg = email.message_from_bytes(full_msg_raw)
-                                    # Extract attachments from bodystructure
-                                    matched_atts = re.findall(
-                                        r'"(?:BASE64|7BIT|8BIT|QUOTED-PRINTABLE)"\s+(\d+)\s+NIL\s+\("(?:INLINE|ATTACHMENT)"\s+\("FILENAME"\s+"([^"]+)"\)\)',
-                                        bs_raw, re.IGNORECASE
-                                    )
-                                    if not matched_atts:
-                                        fns = re.findall(r'"FILENAME"\s+"([^"]+)"', bs_raw, re.IGNORECASE)
-                                        matched_atts = [("0", f) for f in fns]
+                            processed_count += chunk_len
+                            curr_val = min(new_msgs_count, processed_count)
+                            pct = (curr_val * 100) // new_msgs_count
+                            asyncio.run_coroutine_threadsafe(
+                                notify_progress(
+                                    account_id,
+                                    "syncing",
+                                    curr_val,
+                                    new_msgs_count,
+                                    f"正在平稳解析入库: {curr_val} / {new_msgs_count} 封 ({pct}%)"
+                                ),
+                                loop
+                            )
 
-                                    for sz_str, fn_str in matched_atts:
-                                        att_part = email.message.Message()
-                                        att_part["Content-Type"] = "application/octet-stream"
-                                        att_part["Content-Disposition"] = f'attachment; filename="{fn_str}"'
-                                        att_part.set_payload(b"")
-                                        try:
-                                            att_part._estimated_size = int(sz_str)
-                                        except Exception:
-                                            att_part._estimated_size = 0
-                                        msg.attach(att_part)
+                if rate_limit_detected[0]:
+                    raise RuntimeError(rate_limit_msg[0] or "Account exceeded command or bandwidth limits")
 
-                                    chunk_items.append((ln_str, msg, folder, is_sent))
-                        except Exception:
-                            cleanup_worker_mail()
-                            m = get_worker_mail()
+                if stop_event.is_set():
+                    return total_found, processed_count, False, 0
 
-                return chunk_items
+                return total_found, new_msgs_count, has_more_batch, total_pending_all
 
-            processed_count = 0
-            # Execute concurrently with persistent workers; DB writes run serialized on main thread
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_chunk = {executor.submit(fetch_single_chunk, ch): len(ch) for ch in chunks}
-                for future in as_completed(future_to_chunk):
-                    chunk_len = future_to_chunk[future]
-                    try:
-                        fetched_items = future.result()
-                        if fetched_items:
-                            cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
-                    except Exception:
-                        pass
-
-                    processed_count += chunk_len
-                    curr_val = min(new_msgs_count, processed_count)
-                    pct = (curr_val * 100) // new_msgs_count
-                    asyncio.run_coroutine_threadsafe(
-                        notify_progress(
-                            account_id,
-                            "syncing",
-                            curr_val,
-                            new_msgs_count,
-                            f"正在高速并发解析入库: {curr_val} / {new_msgs_count} 封 ({pct}%)"
-                        ),
-                        loop
-                    )
-
-                # Clean up worker pool connections
-                for _ in range(max_workers):
-                    executor.submit(cleanup_worker_mail)
-
-            try:
-                mail.logout()
-            except Exception:
-                pass
-            return total_found, new_msgs_count
+            finally:
+                # Guaranteed cleanup of ALL opened sockets and connections
+                safe_imap_logout(mail)
+                with pool_lock:
+                    for conn in worker_pool_conns:
+                        safe_imap_logout(conn)
+                    worker_pool_conns.clear()
 
         try:
-            total_found, new_count = await loop.run_in_executor(None, worker_sync)
+            total_found, new_count, has_more_batch, total_pending_all = await loop.run_in_executor(None, worker_sync)
+            
+            stop_event = get_or_create_stop_event(account_id)
+            if stop_event.is_set():
+                await notify_progress(account_id, "completed", 0, 0, "同步任务已停止")
+                return
+
             if total_found == 0:
                 await notify_progress(account_id, "completed", 0, 0, "邮箱内无邮件记录")
                 return
@@ -581,14 +804,26 @@ class GenericImapService:
             if new_count > 0:
                 from app.services.stats_service import StatsService
                 await StatsService.rebuild_contacts(account_id)
-                completion_msg = f"增量同步完成：成功导入与深度挖掘 {new_count} 封新增邮件！"
+                if has_more_batch:
+                    remaining_count = max(0, total_pending_all - new_count)
+                    completion_msg = f"分批同步完成：本批成功入库 {new_count} 封（剩余约 {remaining_count} 封待同步），系统已安全收工避让风控。可继续同步或由后台定时推进。"
+                else:
+                    completion_msg = f"增量同步完成：成功导入与深度挖掘 {new_count} 封新增邮件！"
             else:
                 completion_msg = f"增量同步完成：已是最新状态，{total_found} 封邮件均已就绪（无新增信件）。"
 
             await notify_progress(account_id, "completed", total_found, total_found, completion_msg)
 
         except Exception as e:
-            await notify_progress(account_id, "error", 0, 0, f"IMAP 同步异常: {str(e)}")
+            err_text = str(e)
+            err_lower = err_text.lower()
+            if "exceeded command or bandwidth limits" in err_lower:
+                user_msg = "Google 账号触发临时频率与带宽限制保护（通常需等待 15-30 分钟自动恢复），系统已安全暂停同步以保护账号。"
+            elif "too many simultaneous" in err_lower:
+                user_msg = "Gmail 提示并发连接数超限（每个账号上限 15 个连接）。系统已安全释放本地连接；若该邮箱在手机自带邮件或电脑 Outlook/Foxmail 中使用，建议稍候 10-15 分钟待连接超时释放后重试。"
+            else:
+                user_msg = f"IMAP 同步异常: {err_text}"
+            await notify_progress(account_id, "error", 0, 0, user_msg)
 
     @classmethod
     def _save_imap_messages_sync(cls, account_id: str, items: List[Tuple[str, Any, str, bool]], user_email: str = ""):
@@ -674,12 +909,27 @@ class GenericImapService:
                         else:
                             body_text = decoded_content
 
+                # Defensive check: if body_text contains an unparsed raw MIME multipart block, unpack it
+                if body_text and body_text.lstrip().startswith("--"):
+                    clean_text, clean_html = cls._unpack_corrupted_multipart(body_text)
+                    if clean_text or clean_html:
+                        body_text = clean_text
+                        if clean_html and not body_html:
+                            body_html = clean_html
+
                 if not body_text and body_html:
                     try:
                         soup = BeautifulSoup(body_html, "html.parser")
                         body_text = soup.get_text(separator="\n", strip=True)
                     except Exception:
                         body_text = body_html[:1000]
+
+                # Prevent monstrous email payloads (e.g. 5.7MB base64 images in text/html) from blowing up DB & bandwidth
+                MAX_BODY_SAVE_SIZE = 300 * 1024
+                if len(body_text) > MAX_BODY_SAVE_SIZE:
+                    body_text = body_text[:MAX_BODY_SAVE_SIZE] + "\n\n...[邮件正文过长，系统已安全截断保护存储与网络性能]..."
+                if len(body_html) > MAX_BODY_SAVE_SIZE:
+                    body_html = body_html[:MAX_BODY_SAVE_SIZE]
 
                 snippet = (body_text[:120] if body_text else subject).replace("\n", " ")
                 has_attachments = 1 if len(raw_attachments) > 0 else 0

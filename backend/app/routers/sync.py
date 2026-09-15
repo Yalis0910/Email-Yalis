@@ -12,6 +12,30 @@ from app.dependencies import get_current_user, require_permission, get_authorize
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 
+# Global in-memory registry of actively running background sync tasks
+ACTIVE_SYNC_TASKS: Dict[str, asyncio.Task] = {}
+
+def is_account_syncing(account_id: str) -> bool:
+    if account_id in ACTIVE_SYNC_TASKS:
+        t = ACTIVE_SYNC_TASKS[account_id]
+        if not t.done():
+            return True
+    if account_id in SYNC_PROGRESS and SYNC_PROGRESS[account_id].get("status") == "syncing":
+        return True
+    return False
+
+async def cancel_account_sync(account_id: str):
+    from app.services.imap_sync import signal_stop_sync
+    signal_stop_sync(account_id)
+    if account_id in ACTIVE_SYNC_TASKS:
+        t = ACTIVE_SYNC_TASKS.pop(account_id, None)
+        if t and not t.done():
+            t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=1.5)
+            except Exception:
+                pass
+
 @router.get("/auto-settings", response_model=AutoSyncSettingsResponse)
 async def get_auto_sync_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     return await AutoSyncScheduler.get_settings()
@@ -38,29 +62,41 @@ async def trigger_sync(
     current_user: Dict[str, Any] = Depends(require_permission("action:sync_trigger"))
 ):
     check_account_access(req.account_id, current_user)
+    
+    # Check if already syncing to prevent concurrent IMAP duplicate connections
+    already_active = is_account_syncing(req.account_id)
+    if already_active:
+        if not req.force:
+            return {"status": "already_syncing", "message": "该账号正在同步中，请稍候"}
+        else:
+            # Gracefully signal and terminate previous worker before starting anew
+            await cancel_account_sync(req.account_id)
+            await asyncio.sleep(0.5)
+
     async with get_db() as db:
         async with db.execute("SELECT id, email, sync_status, refresh_token FROM accounts WHERE id = ?", (req.account_id,)) as cur:
             row = await cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="未找到该账号")
-            is_active_in_mem = req.account_id in SYNC_PROGRESS and SYNC_PROGRESS[req.account_id].get("status") == "syncing"
-            if row["sync_status"] == "syncing" and is_active_in_mem and not req.force:
-                return {"status": "already_syncing", "message": "该账号正在同步中，请稍候"}
             has_refresh = bool(row["refresh_token"])
 
-    # Run in background
+    # Run in background and register active task
+    acc_id = req.account_id
     if has_refresh:
-        asyncio.create_task(GmailSyncService.sync_account_emails(
-            account_id=req.account_id,
+        task = asyncio.create_task(GmailSyncService.sync_account_emails(
+            account_id=acc_id,
             full_sync=req.full_sync,
             max_results=req.max_results
         ))
     else:
-        asyncio.create_task(GenericImapService.sync_imap_emails(
-            account_id=req.account_id,
+        task = asyncio.create_task(GenericImapService.sync_imap_emails(
+            account_id=acc_id,
             max_results=req.max_results,
             full_sync=req.full_sync
         ))
+
+    ACTIVE_SYNC_TASKS[acc_id] = task
+    task.add_done_callback(lambda _: ACTIVE_SYNC_TASKS.pop(acc_id, None))
 
     return {"status": "started", "message": "已成功启动邮件资产全量抓取与挖掘任务"}
 
@@ -92,22 +128,29 @@ async def trigger_sync_all(
     skipped = []
     for row in rows:
         acc_id = row["id"]
-        is_active_in_mem = acc_id in SYNC_PROGRESS and SYNC_PROGRESS[acc_id].get("status") == "syncing"
-        if row["sync_status"] == "syncing" and is_active_in_mem and not force:
+        already_active = is_account_syncing(acc_id)
+        if already_active and not force:
             skipped.append(row["email"])
             continue
 
+        if already_active and force:
+            await cancel_account_sync(acc_id)
+            await asyncio.sleep(0.3)
+
         has_refresh = bool(row["refresh_token"])
         if has_refresh:
-            asyncio.create_task(GmailSyncService.sync_account_emails(
+            task = asyncio.create_task(GmailSyncService.sync_account_emails(
                 account_id=acc_id,
                 full_sync=full_sync
             ))
         else:
-            asyncio.create_task(GenericImapService.sync_imap_emails(
+            task = asyncio.create_task(GenericImapService.sync_imap_emails(
                 account_id=acc_id,
                 full_sync=full_sync
             ))
+        
+        ACTIVE_SYNC_TASKS[acc_id] = task
+        task.add_done_callback(lambda _, a=acc_id: ACTIVE_SYNC_TASKS.pop(a, None))
         started.append(row["email"])
 
     return {
@@ -187,6 +230,8 @@ async def stop_sync(
     current_user: Dict[str, Any] = Depends(require_permission("action:sync_trigger"))
 ):
     check_account_access(account_id, current_user)
+    await cancel_account_sync(account_id)
+
     from app.services.gmail_sync import notify_progress
     if account_id in SYNC_PROGRESS:
         SYNC_PROGRESS.pop(account_id, None)
@@ -210,8 +255,17 @@ async def stop_sync(
 async def stop_sync_all(
     current_user: Dict[str, Any] = Depends(require_permission("action:sync_trigger"))
 ):
+    from app.services.imap_sync import signal_stop_sync
     from app.services.gmail_sync import notify_progress
+
+    # Stop all active background async tasks and signal workers
+    for acc_id, task in list(ACTIVE_SYNC_TASKS.items()):
+        signal_stop_sync(acc_id)
+        if task and not task.done():
+            task.cancel()
+    ACTIVE_SYNC_TASKS.clear()
     SYNC_PROGRESS.clear()
+
     async with get_db() as db:
         await db.execute("""
             UPDATE accounts
@@ -227,7 +281,9 @@ async def stop_sync_all(
         async with db.execute("SELECT id FROM accounts") as cur:
             rows = await cur.fetchall()
             for r in rows:
+                signal_stop_sync(r["id"])
                 await notify_progress(r["id"], "completed", 0, 0, "已停止同步")
 
     return {"status": "success", "message": "已停止全部同步任务"}
+
 

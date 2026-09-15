@@ -394,13 +394,18 @@ export default function Dashboard({ selectedAccount, onNavigate }) {
           <div className="divide-y divide-[var(--color-border)]/60">
             {data?.top_contacts?.length > 0 ? (
               data.top_contacts.map((contact) => (
-                <div key={contact.id} className="py-3 flex items-center justify-between gap-2 min-w-0">
+                <div 
+                  key={contact.id} 
+                  onClick={() => onNavigate('contacts', { contactId: contact.id, contact })}
+                  className="py-3 flex items-center justify-between gap-2 min-w-0 cursor-pointer hover:bg-[var(--color-surface-subtle)] px-2 rounded-lg transition-colors group"
+                  title="点击查看往来脉络"
+                >
                   <div className="flex items-center space-x-3 min-w-0 flex-1">
-                    <div className="w-8 h-8 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] flex items-center justify-center text-xs font-mono font-medium text-[var(--color-neutral-8)] shrink-0">
+                    <div className="w-8 h-8 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] flex items-center justify-center text-xs font-mono font-medium text-[var(--color-neutral-8)] group-hover:bg-[var(--color-accent)] group-hover:text-white transition-all shrink-0">
                       {(contact.name || contact.email).slice(0, 1).toUpperCase()}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className="text-xs font-medium text-[var(--color-neutral-10)] truncate">
+                      <div className="text-xs font-medium text-[var(--color-neutral-10)] group-hover:text-[var(--color-accent)] transition-colors truncate">
                         {contact.name || contact.email}
                       </div>
                       <div className="text-[11px] text-[var(--color-neutral-6)] font-mono truncate">

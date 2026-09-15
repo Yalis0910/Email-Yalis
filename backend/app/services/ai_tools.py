@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import urllib.parse
 from typing import Dict, Any, List, Optional, Tuple
@@ -16,7 +17,7 @@ COPILOT_TOOLS = [
                 "properties": {
                     "keywords": {
                         "type": "string",
-                        "description": "在邮件主题、摘要或正文中搜索的关键词"
+                        "description": "搜索关键词（建议使用 1~2 个核心词，如 order, invoice, payment, sample, PO 等）。注意：本地邮件库以英文外贸往来为主，提问涉及订单/成交/客户/款项时优先使用对应的英文核心词检索，切勿拼接冗长复合句。"
                     },
                     "from_email": {
                         "type": "string",
@@ -137,6 +138,45 @@ COPILOT_TOOLS = [
                         "type": "integer",
                         "description": "返回的搜索条目上限，默认为 5 条",
                         "default": 5
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_customer_tier",
+            "description": "查询客户的商业分级（A:重点战略/B:培育增长/C:广泛孵化/D:其它）、商机推进阶段(deal_stage)、评级原因及往来情况，用于识别高价值潜在大客户与跟进状态。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email_or_name": {
+                        "type": "string",
+                        "description": "客户邮箱或姓名"
+                    }
+                },
+                "required": ["email_or_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_sales_playbook",
+            "description": "从销售对策与话术资料库中检索针对客户异议（如价格偏高、要求折扣、交期延误、付款账期、竞品对比、沉默激活等）的应对策略和专业高转化回复模板。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "客户异议关键词或场景描述（如：'客户嫌贵要求降价'、'交期太长'、'账期协商'、'长时间未回复破冰'）"
+                    },
+                    "scenario_type": {
+                        "type": "string",
+                        "enum": ["all", "objection_price", "objection_terms", "objection_delivery", "objection_competitor", "follow_up_stale", "win_reasons", "custom"],
+                        "description": "可选分类过滤"
                     }
                 },
                 "required": ["query"]
@@ -425,42 +465,104 @@ async def execute_copilot_tool(
             keywords = (args.get("keywords") or "").strip()
             limit = min(int(args.get("limit") or 10), 25)
 
-            conditions = []
-            params = list(acc_params)
+            base_conditions = []
+            base_params = list(acc_params)
 
             if contact_email:
-                conditions.append("(lower(from_email) LIKE lower(?) OR lower(to_emails) LIKE lower(?) OR lower(cc_emails) LIKE lower(?))")
-                params.extend([f"%{contact_email}%", f"%{contact_email}%", f"%{contact_email}%"])
+                base_conditions.append("(lower(from_email) LIKE lower(?) OR lower(to_emails) LIKE lower(?) OR lower(cc_emails) LIKE lower(?))")
+                base_params.extend([f"%{contact_email}%", f"%{contact_email}%", f"%{contact_email}%"])
             else:
                 if from_email:
-                    conditions.append("(lower(from_email) LIKE lower(?) OR lower(from_name) LIKE lower(?))")
-                    params.extend([f"%{from_email}%", f"%{from_email}%"])
+                    base_conditions.append("(lower(from_email) LIKE lower(?) OR lower(from_name) LIKE lower(?))")
+                    base_params.extend([f"%{from_email}%", f"%{from_email}%"])
                 if to_email:
-                    conditions.append("(lower(to_emails) LIKE lower(?) OR lower(cc_emails) LIKE lower(?))")
-                    params.extend([f"%{to_email}%", f"%{to_email}%"])
+                    base_conditions.append("(lower(to_emails) LIKE lower(?) OR lower(cc_emails) LIKE lower(?))")
+                    base_params.extend([f"%{to_email}%", f"%{to_email}%"])
 
-            if keywords:
-                conditions.append("(subject LIKE ? OR snippet LIKE ?)")
-                params.extend([f"%{keywords}%", f"%{keywords}%"])
+            tokens = [t.strip() for t in re.split(r'[\s,，/、|]+', keywords) if t.strip()] if keywords else []
+            emails = []
 
-            where_clause = ""
-            if acc_filter:
-                conditions.insert(0, acc_filter[:-5])
-            if conditions:
-                where_clause = "WHERE " + " AND ".join(conditions)
+            if not tokens:
+                # No keywords specified, query by address or recent
+                where_clause = ""
+                if acc_filter:
+                    base_conditions.insert(0, acc_filter[:-5])
+                if base_conditions:
+                    where_clause = "WHERE " + " AND ".join(base_conditions)
+                query_sql = f"""
+                    SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                           date_timestamp, date_str, snippet, body_text
+                    FROM emails
+                    {where_clause}
+                    ORDER BY date_timestamp DESC
+                    LIMIT ?
+                """
+                cur = await db.execute(query_sql, base_params + [limit])
+                emails = await cur.fetchall()
+            else:
+                # Multi-phase search:
+                # Phase 1: Exact phrase match
+                p1_conds = list(base_conditions)
+                if acc_filter:
+                    p1_conds.insert(0, acc_filter[:-5])
+                p1_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
+                where_p1 = "WHERE " + " AND ".join(p1_conds)
+                query_p1 = f"""
+                    SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                           date_timestamp, date_str, snippet, body_text
+                    FROM emails
+                    {where_p1}
+                    ORDER BY date_timestamp DESC
+                    LIMIT ?
+                """
+                cur = await db.execute(query_p1, base_params + [f"%{keywords}%", f"%{keywords}%", limit])
+                emails = await cur.fetchall()
 
-            query_sql = f"""
-                SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
-                       date_timestamp, date_str, snippet, body_text
-                FROM emails
-                {where_clause}
-                ORDER BY date_timestamp DESC
-                LIMIT ?
-            """
-            params.append(limit)
+                # Phase 2: If len(tokens) > 1 and exact phrase returned no hits, try ALL tokens (AND)
+                if not emails and len(tokens) > 1:
+                    p2_conds = list(base_conditions)
+                    if acc_filter:
+                        p2_conds.insert(0, acc_filter[:-5])
+                    for _ in tokens:
+                        p2_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
+                    where_p2 = "WHERE " + " AND ".join(p2_conds)
+                    query_p2 = f"""
+                        SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                               date_timestamp, date_str, snippet, body_text
+                        FROM emails
+                        {where_p2}
+                        ORDER BY date_timestamp DESC
+                        LIMIT ?
+                    """
+                    p2_params = list(base_params)
+                    for t in tokens:
+                        p2_params.extend([f"%{t}%", f"%{t}%"])
+                    p2_params.append(limit)
+                    cur = await db.execute(query_p2, p2_params)
+                    emails = await cur.fetchall()
 
-            cur = await db.execute(query_sql, params)
-            emails = await cur.fetchall()
+                # Phase 3: If still no hits, try ANY token (OR) to cover synonym lists (e.g. 'order confirmed deal closed')
+                if not emails and len(tokens) > 1:
+                    p3_conds = list(base_conditions)
+                    if acc_filter:
+                        p3_conds.insert(0, acc_filter[:-5])
+                    or_sub = " OR ".join(["(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))" for _ in tokens])
+                    p3_conds.append(f"({or_sub})")
+                    where_p3 = "WHERE " + " AND ".join(p3_conds)
+                    query_p3 = f"""
+                        SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                               date_timestamp, date_str, snippet, body_text
+                        FROM emails
+                        {where_p3}
+                        ORDER BY date_timestamp DESC
+                        LIMIT ?
+                    """
+                    p3_params = list(base_params)
+                    for t in tokens:
+                        p3_params.extend([f"%{t}%", f"%{t}%"])
+                    p3_params.append(limit)
+                    cur = await db.execute(query_p3, p3_params)
+                    emails = await cur.fetchall()
 
             email_ids = [m["id"] for m in emails]
             email_attachments_map = {}
@@ -671,6 +773,33 @@ async def execute_copilot_tool(
                 "results": web_results
             }
             return result, [], summary
+
+        elif name == "query_customer_tier":
+            target = str(args.get("email_or_name", "")).strip()
+            if not target:
+                return {"error": "缺少客户邮箱或姓名参数"}, [], "查询失败：参数为空"
+            c_cur = await db.execute(f"""
+                SELECT id, account_id, email, name, domain, tier, tier_reason,
+                       deal_stage, estimated_value, last_interaction, inbound_count, outbound_count
+                FROM contacts
+                WHERE {acc_filter} (lower(email) = lower(?) OR lower(name) = lower(?) OR lower(email) LIKE lower(?))
+                LIMIT 1
+            """, acc_params + [target, target, f"%{target}%"])
+            c_row = await c_cur.fetchone()
+            if not c_row:
+                return {"status": "not_found", "message": f"未在客户库中找到 '{target}'"}, [], f"未找到客户 {target}"
+            cd = dict(c_row)
+            tier_label = {"A": "A级 (重点战略)", "B": "B级 (培育增长)", "C": "C级 (广泛孵化)", "D": "D级 (其它)"}.get(cd.get("tier"), "未分级")
+            summary = f"客户 {cd['name'] or cd['email']} 分级为: 【{tier_label}】，商机阶段: 【{cd.get('deal_stage') or 'lead'}】"
+            return {"customer": cd}, [], summary
+
+        elif name == "search_sales_playbook":
+            q = (args.get("query") or "").strip()
+            sc = args.get("scenario_type")
+            from app.services.sales_service import SalesService
+            pbs = await SalesService.list_playbooks(scenario_type=sc, search=q if q != "all" else None)
+            summary = f"从销售话术资料库中检索到 {len(pbs)} 条相关战术对策"
+            return {"matched_playbooks": pbs[:5]}, [], summary
 
         else:
             return {"error": f"未知工具名称: {name}"}, [], f"未知工具: {name}"

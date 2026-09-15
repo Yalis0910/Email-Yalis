@@ -26,6 +26,7 @@ import {
   Layers,
   Square,
   Loader2,
+  KeyRound,
   X
 } from 'lucide-react';
 import { api } from '../api/client';
@@ -163,6 +164,12 @@ export default function Settings({
   const [deletingAccountId, setDeletingAccountId] = useState(null);
   const [deleteModalAccount, setDeleteModalAccount] = useState(null);
   const [accountActionNotice, setAccountActionNotice] = useState(null);
+
+  // Account Password Edit States
+  const [editPasswordAccount, setEditPasswordAccount] = useState(null);
+  const [newAppPassword, setNewAppPassword] = useState('');
+  const [updatingPassword, setUpdatingPassword] = useState(false);
+  const [updatePasswordError, setUpdatePasswordError] = useState(null);
 
   useEffect(() => {
     loadAiPlatforms();
@@ -477,6 +484,35 @@ export default function Settings({
       });
     } finally {
       setDeletingAccountId(null);
+    }
+  };
+
+  const handleSaveNewPassword = async (e) => {
+    e.preventDefault();
+    if (!editPasswordAccount || !newAppPassword.trim()) return;
+
+    try {
+      setUpdatingPassword(true);
+      setUpdatePasswordError(null);
+      const res = await api.connectImap({
+        email: editPasswordAccount.email,
+        password: newAppPassword.trim(),
+        provider: editPasswordAccount.provider || 'custom',
+        imap_host: editPasswordAccount.imap_host || 'imap.gmail.com',
+        imap_port: editPasswordAccount.imap_port || 993,
+        use_ssl: editPasswordAccount.use_ssl !== 0
+      });
+      setEditPasswordAccount(null);
+      setAccountActionNotice({
+        type: 'success',
+        text: `账号 ${editPasswordAccount.email} 的连接凭据已成功更新！原有数据完好保留。`
+      });
+      setTimeout(() => setAccountActionNotice(null), 5000);
+      await loadAccounts();
+    } catch (err) {
+      setUpdatePasswordError(err.message || '更新密码失败，请检查密码或服务配置是否正确');
+    } finally {
+      setUpdatingPassword(false);
     }
   };
 
@@ -1275,6 +1311,18 @@ export default function Settings({
                       </button>
                     )}
                     <button
+                      onClick={() => {
+                        setEditPasswordAccount(acc);
+                        setNewAppPassword('');
+                        setUpdatePasswordError(null);
+                      }}
+                      disabled={isAccSyncing || isSyncingAll || deletingAccountId === acc.id}
+                      className="p-1.5 rounded-md transition-colors text-[var(--color-neutral-6)] hover:text-[var(--color-accent)] hover:bg-[var(--color-surface-subtle)] cursor-pointer disabled:opacity-50"
+                      title={`修改账号 ${acc.email} 的连接密码/授权码`}
+                    >
+                      <KeyRound className="w-3.5 h-3.5" />
+                    </button>
+                    <button
                       onClick={() => handleDeleteAccount(acc)}
                       disabled={deletingAccountId === acc.id || isAccSyncing}
                       className="p-1.5 rounded-md text-[var(--color-neutral-5)] hover:text-rose-600 hover:bg-rose-500/10 transition-colors disabled:opacity-50 cursor-pointer"
@@ -1361,6 +1409,92 @@ export default function Settings({
                 )}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Account Password Update Modal */}
+      {editPasswordAccount && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+          <div className="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4 font-mono">
+            <div className="flex items-start gap-3.5">
+              <div className="p-2.5 rounded-full bg-[var(--color-accent-soft)] text-[var(--color-accent)] border border-[var(--color-accent)]/20 shrink-0">
+                <KeyRound className="w-5 h-5" />
+              </div>
+              <div className="space-y-1 min-w-0">
+                <h3 className="text-sm font-semibold text-[var(--color-neutral-10)]">
+                  更新邮箱连接凭据 / 密码
+                </h3>
+                <p className="text-xs text-[var(--color-neutral-6)] leading-relaxed break-all">
+                  目标邮箱：<span className="text-[var(--color-neutral-9)] font-medium">{editPasswordAccount.email}</span>
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3 bg-[var(--color-surface-subtle)] border border-[var(--color-border)] rounded-lg text-xs space-y-1 text-[var(--color-neutral-7)]">
+              <p className="flex items-center gap-1 font-medium text-[var(--color-neutral-9)]">
+                💡 无损切换，保留数据
+              </p>
+              <p className="text-[11px] leading-relaxed text-[var(--color-neutral-6)]">
+                更新密码只会更新底层的 IMAP 登录凭据；该邮箱已索引的 <b className="text-[var(--color-neutral-9)]">{editPasswordAccount.total_synced || 0}</b> 封邮件、联系人与数字资产数据将<b>完全保留</b>，绝不会被删除。
+              </p>
+            </div>
+
+            <form onSubmit={handleSaveNewPassword} className="space-y-3 pt-1">
+              <div>
+                <label className="block text-xs font-medium text-[var(--color-neutral-8)] mb-1">
+                  新应用专用密码 / 授权码
+                </label>
+                <input
+                  type="password"
+                  value={newAppPassword}
+                  onChange={(e) => setNewAppPassword(e.target.value)}
+                  placeholder="请输入新生成的 16 位应用密码"
+                  required
+                  autoFocus
+                  className="w-full px-3 py-2 text-xs rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-neutral-9)] focus:outline-none focus:border-[var(--color-accent)] font-mono"
+                />
+              </div>
+
+              {updatePasswordError && (
+                <div className="p-2.5 rounded-md text-xs bg-rose-500/10 text-rose-600 border border-rose-500/20 leading-relaxed flex items-start gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  <span>{updatePasswordError}</span>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  disabled={updatingPassword}
+                  onClick={() => {
+                    setEditPasswordAccount(null);
+                    setNewAppPassword('');
+                    setUpdatePasswordError(null);
+                  }}
+                  className="px-4 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-surface-subtle)] text-[var(--color-neutral-8)] transition-all cursor-pointer disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={updatingPassword || !newAppPassword.trim()}
+                  className="px-4 py-1.5 text-xs rounded-md bg-[var(--color-accent)] hover:bg-[var(--color-accent)]/90 text-white font-medium shadow-xs transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {updatingPassword ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>验证并保存中...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>验证并保存</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -206,6 +206,23 @@ export function AIConversationProvider({ children }) {
       abortControllerRef.current.abort();
     }
     setIsStreaming(false);
+    setMessages(prev => {
+      const updated = [...prev];
+      const lastIdx = updated.length - 1;
+      if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+        const start = updated[lastIdx].started_at;
+        const totalDuration = start ? Math.max(1, Math.round((Date.now() - start) / 1000)) : 0;
+        updated[lastIdx] = {
+          ...updated[lastIdx],
+          stream_status: 'stopped',
+          status_message: '已由用户停止生成',
+          is_interrupted: true,
+          is_thinking: false,
+          total_duration: totalDuration
+        };
+      }
+      return updated;
+    });
   };
 
   const clearCurrentMessages = () => {
@@ -218,16 +235,17 @@ export function AIConversationProvider({ children }) {
     }
   };
 
-  const sendMessage = async (text, accountId = null, modelOverride = null, thinkingOverride = null) => {
+  const sendMessage = async (text, accountId = null, modelOverride = null, thinkingOverride = null, historyOverride = null) => {
     const query = (text || '').trim();
     if (!query || isStreaming) return;
 
-    const currentHistory = [...messages];
+    const currentHistory = historyOverride || [...messages];
     const newMessages = [...currentHistory, { role: 'user', content: query, created_at: new Date().toISOString() }];
     setMessages(newMessages);
     setIsStreaming(true);
 
     const assistantIndex = newMessages.length;
+    const startTime = Date.now();
     setMessages([...newMessages, { 
       role: 'assistant', 
       content: '', 
@@ -236,7 +254,13 @@ export function AIConversationProvider({ children }) {
       thinking_duration: 0,
       references: [], 
       tool_calls: [], 
-      created_at: new Date().toISOString() 
+      created_at: new Date().toISOString(),
+      started_at: startTime,
+      last_active_at: startTime,
+      stream_status: 'analyzing',
+      status_message: '正在分析问题意图并检索上下文...',
+      is_interrupted: false,
+      error_message: null
     }]);
 
     abortControllerRef.current = new AbortController();
@@ -268,6 +292,20 @@ export function AIConversationProvider({ children }) {
           establishedConvId = convId;
           setActiveConvId(convId);
         },
+        onStatus: (statusData) => {
+          setMessages(prev => {
+            const updated = [...prev];
+            if (updated[assistantIndex]) {
+              updated[assistantIndex] = {
+                ...updated[assistantIndex],
+                stream_status: statusData.stage || updated[assistantIndex].stream_status,
+                status_message: statusData.message || updated[assistantIndex].status_message,
+                last_active_at: Date.now()
+              };
+            }
+            return updated;
+          });
+        },
         onThinking: (delta) => {
           if (!thinkingStartTime) {
             thinkingStartTime = Date.now();
@@ -281,7 +319,10 @@ export function AIConversationProvider({ children }) {
                 ...updated[assistantIndex],
                 thinking_content: accumulatedThinking,
                 is_thinking: true,
-                thinking_duration: thinkingDuration
+                stream_status: 'thinking',
+                status_message: `正在深度推理思考 (${thinkingDuration}s)...`,
+                thinking_duration: thinkingDuration,
+                last_active_at: Date.now()
               };
             }
             return updated;
@@ -300,7 +341,10 @@ export function AIConversationProvider({ children }) {
             if (updated[assistantIndex]) {
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
-                tool_calls: [...currentTools]
+                stream_status: 'tool_executing',
+                status_message: `正在调用工具检索数据 (${toolData.tool_name})...`,
+                tool_calls: [...currentTools],
+                last_active_at: Date.now()
               };
             }
             return updated;
@@ -308,14 +352,15 @@ export function AIConversationProvider({ children }) {
         },
         onToolResult: (toolData) => {
           currentTools = currentTools.map(t =>
-            t.id === toolData.id ? { ...t, status: 'done', summary: toolData.summary } : t
+            t.id === toolData.id ? { ...t, status: 'completed', summary: toolData.summary, result: toolData.summary } : t
           );
           if (!currentTools.some(t => t.id === toolData.id)) {
             currentTools.push({
               id: toolData.id,
               tool_name: toolData.tool_name,
-              status: 'done',
-              summary: toolData.summary
+              status: 'completed',
+              summary: toolData.summary,
+              result: toolData.summary
             });
           }
           setMessages(prev => {
@@ -323,7 +368,10 @@ export function AIConversationProvider({ children }) {
             if (updated[assistantIndex]) {
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
-                tool_calls: [...currentTools]
+                tool_calls: [...currentTools],
+                stream_status: 'synthesizing',
+                status_message: '数据检索完成，大模型正在深度思考并组织回答...',
+                last_active_at: Date.now()
               };
             }
             return updated;
@@ -337,7 +385,8 @@ export function AIConversationProvider({ children }) {
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
                 references: currentRefs,
-                tool_calls: [...currentTools]
+                tool_calls: [...currentTools],
+                last_active_at: Date.now()
               };
             }
             return updated;
@@ -351,9 +400,12 @@ export function AIConversationProvider({ children }) {
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
                 content: accumulatedText,
+                stream_status: 'generating',
+                status_message: 'AI 正在输出回答...',
                 is_thinking: false,
                 references: currentRefs,
-                tool_calls: [...currentTools]
+                tool_calls: [...currentTools],
+                last_active_at: Date.now()
               };
             }
             return updated;
@@ -375,13 +427,17 @@ export function AIConversationProvider({ children }) {
         },
         onError: (err) => {
           setIsCompressing(false);
+          const totalDur = Math.max(1, Math.round((Date.now() - startTime) / 1000));
           setMessages(prev => {
             const updated = [...prev];
             if (updated[assistantIndex]) {
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
                 is_thinking: false,
-                content: updated[assistantIndex].content + `\n\n> ⚠️ **错误**: ${err}`
+                stream_status: 'error',
+                error_message: err,
+                status_message: `生成中断: ${err}`,
+                total_duration: totalDur
               };
             }
             return updated;
@@ -390,12 +446,23 @@ export function AIConversationProvider({ children }) {
         onDone: async () => {
           setIsStreaming(false);
           setIsCompressing(false);
+          const totalDur = Math.max(1, Math.round((Date.now() - startTime) / 1000));
+          currentTools = currentTools.map(t => ({
+            ...t,
+            status: 'completed',
+            summary: t.summary || '检索完成'
+          }));
           setMessages(prev => {
             const updated = [...prev];
             if (updated[assistantIndex]) {
+              const prevStatus = updated[assistantIndex].stream_status;
               updated[assistantIndex] = {
                 ...updated[assistantIndex],
-                is_thinking: false
+                is_thinking: false,
+                stream_status: (prevStatus === 'error' || prevStatus === 'stopped') ? prevStatus : 'done',
+                status_message: prevStatus === 'stopped' ? '已由用户停止生成' : (prevStatus === 'error' ? updated[assistantIndex].status_message : '回答生成完成'),
+                tool_calls: [...currentTools],
+                total_duration: totalDur
               };
             }
             return updated;
@@ -407,6 +474,37 @@ export function AIConversationProvider({ children }) {
         }
       }
     );
+  };
+
+  const regenerateResponse = async (targetIndex = null, accountId = null) => {
+    if (isStreaming) return;
+
+    let queryToResend = '';
+    let sliceUntil = messages.length;
+
+    if (targetIndex !== null && targetIndex >= 0 && targetIndex < messages.length) {
+      if (messages[targetIndex].role === 'assistant' && targetIndex > 0) {
+        queryToResend = messages[targetIndex - 1].content;
+        sliceUntil = targetIndex - 1;
+      } else if (messages[targetIndex].role === 'user') {
+        queryToResend = messages[targetIndex].content;
+        sliceUntil = targetIndex;
+      }
+    } else {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          queryToResend = messages[i].content;
+          sliceUntil = i;
+          break;
+        }
+      }
+    }
+
+    if (!queryToResend) return;
+
+    const rolledBackHistory = messages.slice(0, sliceUntil);
+    setMessages(rolledBackHistory);
+    await sendMessage(queryToResend, accountId, null, null, rolledBackHistory);
   };
 
   const activeConversation = conversations.find(c => c.id === activeConvId) || null;
@@ -503,6 +601,7 @@ export function AIConversationProvider({ children }) {
         newConversation,
         deleteConversation,
         sendMessage,
+        regenerateResponse,
         stopStreaming,
         clearCurrentMessages,
         contextStats,

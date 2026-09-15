@@ -16,6 +16,7 @@ PAGE_PERMISSIONS = [
     {"key": "page:attachments", "label": "附件中心", "desc": "允许检索、分类预览与下载邮件附件"},
     {"key": "page:contacts", "label": "人脉网络", "desc": "允许查阅往来联系人、往来频次与 AI 关系画像"},
     {"key": "page:emails", "label": "检索阅读", "desc": "允许全文搜索邮件正文、阅读邮件内容与线索"},
+    {"key": "page:sales_playbook", "label": "话术资料库", "desc": "允许查阅与维护外贸实战异议应答策略、跟进模版与复盘案例库"},
     {"key": "page:ai_copilot", "label": "AI 助手", "desc": "允许使用 AI Copilot 问答工作台与邮件总结草拟"},
     {"key": "page:settings", "label": "配置授权", "desc": "允许查看邮箱连接状态与基础系统配置"},
     {"key": "page:rbac", "label": "组织权限", "desc": "允许访问组织架构、管理组配置与成员账号管理"},
@@ -51,6 +52,7 @@ DEFAULT_USER_GROUPS = [
             "page:attachments",
             "page:contacts",
             "page:emails",
+            "page:sales_playbook",
             "page:ai_copilot",
             "page:settings",
         ],
@@ -69,6 +71,7 @@ DEFAULT_USER_GROUPS = [
             "page:attachments",
             "page:contacts",
             "page:emails",
+            "page:sales_playbook",
             "page:ai_copilot",
         ],
         "actions": [
@@ -174,8 +177,9 @@ class AuthService:
 
         # 1. Ensure all default groups exist
         for grp in DEFAULT_USER_GROUPS:
-            cur_grp = conn.execute("SELECT id FROM user_groups WHERE id = ?", (grp["id"],))
-            if not cur_grp.fetchone():
+            cur_grp = conn.execute("SELECT id, page_permissions_json FROM user_groups WHERE id = ?", (grp["id"],))
+            row_grp = cur_grp.fetchone()
+            if not row_grp:
                 conn.execute("""
                     INSERT INTO user_groups (id, name, description, page_permissions_json, action_permissions_json, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))
@@ -189,6 +193,15 @@ class AuthService:
                             INSERT OR IGNORE INTO group_account_permissions (group_id, account_id, created_at)
                             VALUES (?, ?, datetime('now', 'localtime'))
                         """, (grp["id"], acc_row[0]))
+                except Exception:
+                    pass
+            else:
+                try:
+                    existing_pages = set(json.loads(row_grp[1]) if row_grp[1] else [])
+                    needed_pages = set(grp["pages"])
+                    if not needed_pages.issubset(existing_pages):
+                        merged_pages = list(existing_pages.union(needed_pages))
+                        conn.execute("UPDATE user_groups SET page_permissions_json = ?, updated_at = datetime('now', 'localtime') WHERE id = ?", (json.dumps(merged_pages), grp["id"]))
                 except Exception:
                     pass
 

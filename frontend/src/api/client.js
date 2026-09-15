@@ -190,14 +190,14 @@ export const api = {
   getContactsGraph: (accountId, limit = 35) => {
     return request(`/api/contacts/graph${buildQuery({ account_id: accountId, limit })}`);
   },
-  getContactTimeline: (contactId, order = 'desc') => {
-    return request(`/api/contacts/${contactId}/timeline?order=${order}`);
+  getContactTimeline: (contactId, order = 'desc', options = {}) => {
+    return request(`/api/contacts/${contactId}/timeline?order=${order}`, options);
   },
-  getSummarizedContacts: (accountId, sortBy = 'weight') => {
-    return request(`/api/contacts/ai-reports/list${buildQuery({ account_id: accountId, sort_by: sortBy })}`);
+  getSummarizedContacts: (accountId, sortBy = 'weight', options = {}) => {
+    return request(`/api/contacts/ai-reports/list${buildQuery({ account_id: accountId, sort_by: sortBy })}`, options);
   },
-  getContactAIReport: (contactId) => {
-    return request(`/api/contacts/${contactId}/ai-report`);
+  getContactAIReport: (contactId, options = {}) => {
+    return request(`/api/contacts/${contactId}/ai-report`, options);
   },
   deleteContactAIReport: (contactId) => {
     return request(`/api/contacts/${contactId}/ai-report`, { method: 'DELETE' });
@@ -257,10 +257,41 @@ export const api = {
   }),
   getAIConversationContextStats: (id, model = null) => request(
     `/api/ai/conversations/${id}/context-stats${model ? `?model=${encodeURIComponent(model)}` : ''}`
-  )
+  ),
+
+  // ================= Sales CRM API =================
+  getTierStats: (accountId = null) => request(`/api/sales/contacts/tier-stats${buildQuery({ account_id: accountId })}`),
+  getSalesRadar: (accountId = null) => request(`/api/sales/radar${buildQuery({ account_id: accountId })}`),
+  updateContactTier: (contactId, data) => request(`/api/sales/contacts/${contactId}/tier`, {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
+  evaluateContactTier: (contactId, forceRefresh = false, model = null) => request(
+    `/api/sales/contacts/${contactId}/evaluate-tier${buildQuery({ force_refresh: forceRefresh, model })}`,
+    { method: 'POST' }
+  ),
+  reviewContactDeal: (contactId, data) => request(`/api/sales/contacts/${contactId}/review-deal`, {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
+  getContactDealReviews: (contactId) => request(`/api/sales/contacts/${contactId}/reviews`),
+  getSalesPlaybooks: (scenarioType = null, search = null) => request(
+    `/api/sales/playbook${buildQuery({ scenario_type: scenarioType, search })}`
+  ),
+  createSalesPlaybook: (data) => request('/api/sales/playbook', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
+  updateSalesPlaybook: (id, data) => request(`/api/sales/playbook/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data)
+  }),
+  deleteSalesPlaybook: (id) => request(`/api/sales/playbook/${id}`, {
+    method: 'DELETE'
+  })
 };
 
-export async function streamSSE(endpoint, body, { onChunk, onThinking, onReferences, onCached, onConversation, onToolStart, onToolResult, onCompressing, onCompressed, onContextStats, onError, onDone, signal } = {}) {
+export async function streamSSE(endpoint, body, { onChunk, onThinking, onStatus, onReferences, onCached, onConversation, onToolStart, onToolResult, onCompressing, onCompressed, onContextStats, onEvent, onError, onDone, signal } = {}) {
   try {
     const token = typeof localStorage !== 'undefined' ? localStorage.getItem('email_yalis_token') : null;
     const authHeaders = token ? { 'Authorization': `Bearer ${token}` } : {};
@@ -338,6 +369,11 @@ export async function streamSSE(endpoint, body, { onChunk, onThinking, onReferen
                 onCompressed(data);
               } else if (data.type === 'context_stats' && onContextStats) {
                 onContextStats(data.stats);
+              } else if (data.type === 'status' && onStatus) {
+                onStatus(data);
+              }
+              if (onEvent) {
+                onEvent(data);
               }
             } catch (e) {
               console.error('SSE parse error:', e);

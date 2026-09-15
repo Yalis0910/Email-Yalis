@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Sparkles, 
   RefreshCw, 
@@ -48,6 +48,7 @@ export default function ContactAIReportDrawer({
   streamingReportText,
   onRegenerate,
   cachedReport,
+  isReportLoading = false,
   selectedAccount,
   sortBy = 'weight'
 }) {
@@ -56,6 +57,7 @@ export default function ContactAIReportDrawer({
   const [searchFilter, setSearchFilter] = useState('');
   const [copied, setCopied] = useState(false);
   const [currentSortBy, setCurrentSortBy] = useState(sortBy);
+  const wasGeneratingRef = useRef(false);
 
   useEffect(() => {
     if (sortBy) {
@@ -63,12 +65,21 @@ export default function ContactAIReportDrawer({
     }
   }, [sortBy]);
 
-  // Load summarized contacts list whenever drawer is opened or report changes
+  // Load summarized contacts list: only when drawer is opened, sort/account changes, or new generation completes
+  useEffect(() => {
+    if (isOpen) {
+      if (wasGeneratingRef.current && !isGenerating) {
+        loadSummarizedContacts(currentSortBy);
+      }
+    }
+    wasGeneratingRef.current = isGenerating;
+  }, [isGenerating, isOpen, currentSortBy]);
+
   useEffect(() => {
     if (isOpen) {
       loadSummarizedContacts(currentSortBy);
     }
-  }, [isOpen, cachedReport, isGenerating, currentSortBy, selectedAccount]);
+  }, [isOpen, currentSortBy, selectedAccount]);
 
   const loadSummarizedContacts = async (sortOrder = currentSortBy) => {
     try {
@@ -436,6 +447,13 @@ export default function ContactAIReportDrawer({
               </p>
               <p className="text-[11px] font-mono text-[var(--color-neutral-5)]">
                 包括角色画像、阶段历程、高频议题、账单交易与跟进建议
+              </p>
+            </div>
+          ) : isReportLoading && !displayReportText ? (
+            <div className="py-24 text-center space-y-3">
+              <div className="w-6 h-6 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin mx-auto" />
+              <p className="text-xs font-mono text-[var(--color-neutral-6)]">
+                正在调取人脉画像报告...
               </p>
             </div>
           ) : displayReportText ? (

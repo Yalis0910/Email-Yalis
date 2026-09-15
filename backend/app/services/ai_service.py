@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import re
@@ -549,16 +550,22 @@ class AIService:
         }
 
         # Adapt thinking / reasoning parameters based on model type and thinking_level
-        if thinking_level and thinking_level in ["low", "medium", "high"]:
+        if thinking_level and thinking_level in ["low", "medium", "high", "max"]:
+            eff = "high" if thinking_level == "max" else thinking_level
             if "o1" in model_lower or "o3" in model_lower:
-                payload["reasoning_effort"] = thinking_level
+                payload["reasoning_effort"] = eff
                 # OpenAI o1/o3 uses max_completion_tokens
                 payload["max_completion_tokens"] = payload.pop("max_tokens", max_tokens)
                 payload.pop("temperature", None)
             elif "claude-3-7" in model_lower:
-                budget = 1024 if thinking_level == "low" else (4096 if thinking_level == "medium" else 16384)
+                budget = 1024 if thinking_level == "low" else (4096 if thinking_level == "medium" else (32768 if thinking_level == "max" else 16384))
                 payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 payload["max_tokens"] = max(payload.get("max_tokens", 2000), budget + 1000)
+            else:
+                # Standard OpenAI/Gemini/DeepSeek/Qwen reasoning parameter
+                payload["reasoning_effort"] = eff
+                if thinking_level == "max":
+                    payload["max_tokens"] = max(payload.get("max_tokens", 2000), 4096)
 
         try:
             async with httpx.AsyncClient(timeout=90.0) as client:
@@ -571,6 +578,7 @@ class AIService:
                         return
 
                     in_think_tag = False
+                    in_tool_call_tag = False
                     async for line in response.aiter_lines():
                         line = line.strip()
                         if not line or not line.startswith("data:"):
@@ -584,25 +592,52 @@ class AIService:
                             choice = chunk.get("choices", [{}])[0]
                             delta = choice.get("delta", {})
 
-                            # Channel 1: delta.reasoning_content (DeepSeek-R1, SiliconFlow, NewAPI, etc.)
-                            reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                            # Channel 1: delta.reasoning_content (DeepSeek-R1, SiliconFlow, Gemini/OpenAI proxies)
+                            reasoning_piece = (
+                                delta.get("reasoning_content") 
+                                or delta.get("reasoning") 
+                                or delta.get("thought") 
+                                or delta.get("thought_content") 
+                                or ""
+                            )
                             if reasoning_piece:
                                 yield f"data: {json.dumps({'type': 'thinking', 'delta': reasoning_piece}, ensure_ascii=False)}\n\n"
 
-                            # Channel 2: delta.content (may contain <think>...</think> for Ollama/local models)
+                            # Channel 2: delta.content (may contain <think>...</think> or raw <tool_call>...</tool_call>)
                             content_piece = delta.get("content", "")
                             if content_piece:
-                                if "<think>" in content_piece:
+                                # Suppress/filter out any raw <tool_call> XML emitted by model during synthesis
+                                if "<tool_call" in content_piece:
+                                    in_tool_call_tag = True
+                                    tc_parts = content_piece.split("<tool_call", 1)
+                                    if tc_parts[0]:
+                                        yield f"data: {json.dumps({'type': 'chunk', 'delta': tc_parts[0]}, ensure_ascii=False)}\n\n"
+                                    content_piece = tc_parts[1]
+
+                                if in_tool_call_tag:
+                                    if "</tool_call>" in content_piece:
+                                        in_tool_call_tag = False
+                                        tc_parts = content_piece.split("</tool_call>", 1)
+                                        if len(tc_parts) > 1 and tc_parts[1]:
+                                            content_piece = tc_parts[1]
+                                        else:
+                                            continue
+                                    else:
+                                        continue
+
+                                if "<think>" in content_piece or "<thought>" in content_piece:
                                     in_think_tag = True
-                                    parts = content_piece.split("<think>", 1)
+                                    tag = "<think>" if "<think>" in content_piece else "<thought>"
+                                    parts = content_piece.split(tag, 1)
                                     if parts[0]:
                                         yield f"data: {json.dumps({'type': 'chunk', 'delta': parts[0]}, ensure_ascii=False)}\n\n"
                                     content_piece = parts[1]
 
                                 if in_think_tag:
-                                    if "</think>" in content_piece:
+                                    closing_tag = "</think>" if "</think>" in content_piece else ("</thought>" if "</thought>" in content_piece else None)
+                                    if closing_tag:
                                         in_think_tag = False
-                                        think_parts = content_piece.split("</think>", 1)
+                                        think_parts = content_piece.split(closing_tag, 1)
                                         if think_parts[0]:
                                             yield f"data: {json.dumps({'type': 'thinking', 'delta': think_parts[0]}, ensure_ascii=False)}\n\n"
                                         if len(think_parts) > 1 and think_parts[1]:
@@ -765,9 +800,36 @@ class AIService:
             "clarify": "严谨追问、针对关键细节礼貌请求对方进一步确认或提供材料"
         }.get(tone, "专业得体、商务礼貌")
 
-        body = (email["body_text"] or email["snippet"] or "").strip()
-        if len(body) > 3000:
-            body = body[:3000] + "..."
+        # Look up contact profile and tier
+        contact_tier_info = ""
+        contact_email_addr = (email["from_email"] or "").strip().lower()
+        matched_playbooks = []
+        async with get_db() as db:
+            if contact_email_addr:
+                c_cur = await db.execute("SELECT name, tier, deal_stage, estimated_value FROM contacts WHERE lower(email) = ? LIMIT 1", (contact_email_addr,))
+                c_row = await c_cur.fetchone()
+                if c_row:
+                    tier_str = c_row["tier"] or "普通"
+                    stage_str = c_row["deal_stage"] or "沟通中"
+                    contact_tier_info = f"- 目标客户画像: 【{tier_str} 级客户】| 当前商机阶段: 【{stage_str}】"
+
+            # Match sales playbooks against email body & subject
+            search_text = (f"{email['subject'] or ''} {body}").lower()
+            pb_cur = await db.execute("SELECT title, scenario_type, trigger_pattern, response_strategy, reply_template FROM sales_playbook")
+            all_pbs = await pb_cur.fetchall()
+            for pb in all_pbs:
+                patterns = [p.strip().lower() for p in (pb["trigger_pattern"] or "").split(",") if p.strip()]
+                if any(p in search_text for p in patterns):
+                    matched_playbooks.append(pb)
+                    if len(matched_playbooks) >= 2:
+                        break
+
+        playbook_instruction = ""
+        if matched_playbooks:
+            pb_snippets = []
+            for p in matched_playbooks:
+                pb_snippets.append(f"• 【{p['title']}】\n  应对策略要点: {p['response_strategy']}\n  话术参考范式: {p['reply_template'][:300]}...")
+            playbook_instruction = f"\n【销售对策库推荐应对策略（针对信中客户异议或关切点）】：\n" + "\n\n".join(pb_snippets) + "\n"
 
         prompt = f"""请针对以下来信，起草一封得体的高质量回复邮件。
 
@@ -775,17 +837,19 @@ class AIService:
 发件人: {email['from_name'] or '对方'} <{email['from_email']}>
 来信主题: {email['subject']}
 来信日期: {email['date_str']}
+{contact_tier_info}
 来信内容:
 {body}
-
+{playbook_instruction}
 【回复要求】
 1. 回复语气风格：{tone_instructions}。
 2. 用户的特殊指示与意图：{user_notes if user_notes.strip() else '根据来信内容做出最恰当的常规回复'}。
-3. 格式规范：包含称谓、正文、祝颂语及署名占位符，排版清晰美观。直接输出回复草稿全文，不要前缀额外说明。
+3. 战术运用：如检测到客户提出了价格/交期/付款方式等疑虑，请严格采纳上述对策库中的专业应对策略进行解答或化解。
+4. 格式规范：包含称谓、正文、祝颂语及署名占位符，排版清晰美观。直接输出回复草稿全文，不要前缀额外说明。
 """
 
         messages = [
-            {"role": "system", "content": "你是一位优秀的商务与个人事务邮件写作专家。"},
+            {"role": "system", "content": "你是一位优秀的商务外贸与大客户关系邮件写作专家，擅长高效推进商机与化解客户疑虑。"},
             {"role": "user", "content": prompt}
         ]
 
@@ -1285,6 +1349,7 @@ class AIService:
 
         # Emit conversation metadata
         yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': active_conv_id, 'contact_id': effective_contact_id}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'stage': 'analyzing', 'message': '正在分析问题意图并检索上下文...'}, ensure_ascii=False)}\n\n"
 
         if contact_initial_refs:
             yield f"data: {json.dumps({'type': 'references', 'references': contact_initial_refs}, ensure_ascii=False)}\n\n"
@@ -1318,10 +1383,15 @@ class AIService:
 
 【工作准则】：
 1. 遇到需要查询具体人脉、往来邮件、附件内容、收发记录、账单开销或账号的问题，必须优先主动调用相应工具查询真实数据库，切勿凭空猜测。
-2. 若用户提问涉及附件细节（如发票金额、报价条目、工单明细等），可先通过 `search_emails` 或联系人往来邮件识别附件 ID，再调用 `inspect_attachment` 解析附件内容后再回答。
-3. 遇到涉及外部公司背景、未知 SaaS 平台介绍、最新汇率、行业资讯或用户明确要求联网检索的问题，主动调用 `search_web` 获取准确客观的外部信息。
-4. 若回答依据了具体检索出的邮件或附件所属邮件，必须在陈述句末尾带上引用标记 `[REF:email_id|邮件主题|日期]`，系统前端会自动将其渲染为可点击的邮件卡片。
-5. 排版清晰，善于使用 Markdown 列表、加粗以及表格进行对比展示。
+2. 【多轮对话与指代消解】：当用户提问包含指代性代词（如“这名客户”、“该订单”、“他的邮箱”、“对方”、“为什么丢单”）时，必须结合前文对话中已提到的客户姓名（如 Kelly Marzo）、邮箱或订单号，将其作为参数传入工具进行定向精准检索，切勿脱离上下文断章取义。
+3. 【业务背景与检索规范】：
+   - 本地邮件库以英文外贸往来业务为主（常见如 MaxEmblem 徽章/硬币/布贴/勋章定制，核心业务词包括 order, invoice, payment, sample, PO, quotation, shipment, tracking 等）。
+   - 当用户使用中文询问涉及“订单、客户、成交、发票、合同、报价、物流”等业务时，调用 `search_emails` 的 `keywords` 必须优先结合常见的英文核心词（例如 "order", "invoice", "payment", "sample" 等）或指定联系人邮箱/姓名，切勿只搜索中文词导致检索为空。
+   - 【核心词精简】：`keywords` 请使用 1~2 个精简核心词（如 "order" 或 "invoice"），切勿拼接冗长长难句（如 "order confirmed deal closed"），以确保检索命中率。
+4. 若用户提问涉及附件细节（如发票金额、报价条目、工单明细等），可先通过 `search_emails` 或联系人往来邮件识别附件 ID，再调用 `inspect_attachment` 解析附件内容后再回答。
+5. 遇到涉及外部公司背景、未知 SaaS 平台介绍、最新汇率、行业资讯或用户明确要求联网检索的问题，主动调用 `search_web` 获取准确客观的外部信息。
+6. 若回答依据了具体检索出的邮件或附件所属邮件，必须在陈述句末尾带上引用标记 `[REF:email_id|邮件主题|日期]`，系统前端会自动将其渲染为可点击的邮件卡片。
+7. 排版清晰，善于使用 Markdown 列表、加粗以及表格进行对比展示。
 """
         if contact_context_prompt:
             agent_system_prompt += f"\n{contact_context_prompt}\n【特别指令】：当前会话是专门针对上述联系人的专属探讨。请依据提供的往来时间线与画像深入解答用户问题。若引述具体邮件，必须标注引用卡片标记 `[REF:email_id|主题|日期]`。"
@@ -1391,6 +1461,10 @@ class AIService:
                         "tool_choice": "auto",
                         "temperature": 0.2
                     }
+                    if thinking_level and thinking_level in ["low", "medium", "high", "max"]:
+                        if "o1" not in (resolved_model or "").lower() and "claude-3-7" not in (resolved_model or "").lower():
+                            payload["reasoning_effort"] = "high" if thinking_level == "max" else thinking_level
+
                     resp = await client.post(target_url, headers=headers, json=payload)
                     if resp.status_code != 200:
                         raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -1402,11 +1476,27 @@ class AIService:
                     if not tool_calls:
                         if not any_tool_called:
                             # Model did not call any tools at all (e.g. casual conversational query)
+                            direct_reasoning = (
+                                choice_msg.get("reasoning_content") 
+                                or choice_msg.get("reasoning") 
+                                or choice_msg.get("thought") 
+                                or choice_msg.get("thought_content") 
+                                or ""
+                            )
+                            if direct_reasoning:
+                                accumulated_thinking.append(direct_reasoning)
+                                yield f"data: {json.dumps({'type': 'thinking', 'delta': direct_reasoning}, ensure_ascii=False)}\n\n"
+
                             direct_content = choice_msg.get("content", "")
                             if direct_content and direct_content.strip():
                                 accumulated_reply.append(direct_content)
-                                yield f"data: {json.dumps({'type': 'chunk', 'delta': direct_content}, ensure_ascii=False)}\n\n"
+                                chunk_size = 12
+                                for i in range(0, len(direct_content), chunk_size):
+                                    chunk_slice = direct_content[i:i+chunk_size]
+                                    yield f"data: {json.dumps({'type': 'chunk', 'delta': chunk_slice}, ensure_ascii=False)}\n\n"
+                                    await asyncio.sleep(0.015)
                                 yield "data: [DONE]\n\n"
+                                return
                             else:
                                 async for chunk in cls._stream_llm(messages, temperature=0.5, max_tokens=2200, model=resolved_model, platform_id=platform_id, thinking_level=thinking_level):
                                     yield chunk
@@ -1439,6 +1529,8 @@ class AIService:
                             fn_args = {}
 
                         # 1. Emit tool_start
+                        tool_display_name = TOOL_NAMES.get(fn_name, fn_name) if 'TOOL_NAMES' in globals() else fn_name
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'tool_executing', 'message': f'正在调用工具检索数据（{fn_name}）...'}, ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps({'type': 'tool_start', 'id': tc_id, 'tool_name': fn_name, 'args': fn_args}, ensure_ascii=False)}\n\n"
 
                         # 2. Execute local tool
@@ -1473,7 +1565,16 @@ class AIService:
 
                 # If tools were executed, stream final synthesis turn with thinking support
                 if any_tool_called:
-                    async for chunk in cls._stream_llm(messages, temperature=0.5, max_tokens=2200, model=resolved_model, platform_id=platform_id, thinking_level=thinking_level):
+                    ref_count = len(all_references)
+                    ref_hint = f"（已引用 {ref_count} 项数据）" if ref_count > 0 else ""
+                    yield f"data: {json.dumps({'type': 'status', 'stage': 'synthesizing', 'message': f'数据检索完成{ref_hint}，大模型正在深度思考并组织回答...'}, ensure_ascii=False)}\n\n"
+                    
+                    synthesis_messages = list(messages)
+                    synthesis_messages.append({
+                        "role": "user",
+                        "content": "【系统指令】：所有本地工具数据检索阶段已全部执行完毕。请直接根据上方已获取到的数据事实（若未检索到直接匹配的记录，请如实告知未找到，并结合本邮件库以英文外贸业务为主的背景，建议用户提供具体英文核心词如 order, invoice, payment 或指定客户邮箱），用自然流畅的中文直接向用户输出清晰专业的最终回答。切勿再输出任何 <tool_call>、<function> 标签或工具调用代码块。"
+                    })
+                    async for chunk in cls._stream_llm(synthesis_messages, temperature=0.5, max_tokens=2200, model=resolved_model, platform_id=platform_id, thinking_level=thinking_level):
                         yield chunk
                         if "data: " in chunk and "[DONE]" not in chunk:
                             try:
@@ -1490,7 +1591,7 @@ class AIService:
                                 pass
         except Exception as e:
             # Fallback to pre-retrieval RAG mode if tools calling is unsupported or failed
-            context_str, references = await search_context_for_query(query, account_id)
+            context_str, references = await search_context_for_query(query, account_id, history=active_history)
             all_references = list(references)
             for cr in contact_initial_refs:
                 if not any(x.get("id") == cr.get("id") for x in all_references):
@@ -1501,10 +1602,11 @@ class AIService:
 用户正在向你提问关于他的本地邮件库、SaaS 资产、订阅账单与联系人的问题。
 
 你的核心工作准则：
-1. 【忠于事实】：必须优先依据下方提供的【本地系统检索到的真实数据】进行回答，切勿捏造未出现的数据。
-2. 【引用标注】：若陈述依据了具体检索出的邮件，必须在陈述句末尾带上引用标记 `[REF:email_id|邮件主题|日期]`，系统前端会自动将其渲染为可点击的邮件卡片。
-3. 【排版清晰】：善于使用 Markdown 列表、加粗以及表格组织对比数据。如果用户询问费用，请汇总出总额与明细。
-4. 【无记录时诚实反馈】：如果检索数据中没有相关信息，请如实告知未找到，并建议用户使用具体的关键词或检查邮箱同步状态。
+1. 【多轮对话连续性与历史记忆】：用户的提问通常基于前文对话展开（例如“这名客户”、“该订单”、“他的邮箱”、“为什么”）。请务必紧密结合上下文对话历史进行理解与回答。前文已确认的事实与实体依然成立有效，切勿因为当前单轮增量检索未重复包含该实体而盲目怀疑或否定前文真实发生的结论。
+2. 【忠于事实】：当陈述具体业务细节、邮件内容、订单号或金额时，优先依据下方提供的【本地系统检索到的真实数据】以及前文对话已确认的事实，切勿凭空捏造未出现的数据。
+3. 【引用标注】：若陈述依据了具体检索出的邮件，必须在陈述句末尾带上引用标记 `[REF:email_id|邮件主题|日期]`，系统前端会自动将其渲染为可点击的邮件卡片。
+4. 【排版清晰】：善于使用 Markdown 列表、加粗以及表格组织对比数据。如果用户询问费用，请汇总出总额与明细。
+5. 【无记录时诚实反馈】：如果检索数据与上下文历史中均无相关信息，请如实告知未找到，并建议用户使用具体的中英文关键词进行定向搜索。
 """
             if contact_context_prompt:
                 rag_system_prompt += f"\n{contact_context_prompt}\n"
@@ -1525,6 +1627,10 @@ class AIService:
                     fallback_messages.append({"role": role, "content": content})
             fallback_messages.append({"role": "user", "content": query})
 
+            ref_count = len(all_references)
+            ref_hint = f"（匹配到 {ref_count} 封关联邮件）" if ref_count > 0 else ""
+            yield f"data: {json.dumps({'type': 'status', 'stage': 'synthesizing', 'message': f'本地数据检索完成{ref_hint}，正在深度分析并组织回答...'}, ensure_ascii=False)}\n\n"
+
             async for chunk in cls._stream_llm(fallback_messages, temperature=0.5, max_tokens=2200, model=resolved_model, platform_id=platform_id, thinking_level=thinking_level):
                 yield chunk
                 if "data: " in chunk and "[DONE]" not in chunk:
@@ -1543,6 +1649,8 @@ class AIService:
 
         # Save assistant message
         full_reply_text = "".join(accumulated_reply).strip()
+        full_reply_text = re.sub(r'<tool_call>[\s\S]*?<\/tool_call>', '', full_reply_text).strip()
+        full_reply_text = re.sub(r'<tool_call>[\s\S]*', '', full_reply_text).strip()
         full_thinking_text = "".join(accumulated_thinking).strip() or None
         thinking_duration = 0
         if thinking_start_time:

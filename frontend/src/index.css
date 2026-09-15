@@ -9,6 +9,7 @@
     /* Yohaku Palette: Light (Warm Paper / 和纸) */
     --color-paper: #faf9f5;
     --color-surface: #ffffff;
+    --color-card: #ffffff;
     --color-surface-subtle: #f4f3ed;
     --color-accent: #c56473; /* Signature Yohaku dusty rose / vermilion */
     --color-accent-soft: rgba(197, 100, 115, 0.08);
@@ -40,6 +41,7 @@
     /* Yohaku Palette: Dark (Matte Charcoal / 墨色) */
     --color-paper: #161618;
     --color-surface: #1e1e21;
+    --color-card: #1e1e21;
     --color-surface-subtle: #252529;
     --color-accent: #d87887;
     --color-accent-soft: rgba(216, 120, 135, 0.12);

@@ -6,16 +6,23 @@ import { Mail } from 'lucide-react';
 export default function MarkdownRenderer({ content, onSelectEmail, className = '' }) {
   if (!content) return null;
 
+  // Sanitize any raw tool_call XML tags leaked from LLM
+  const sanitizedContent = content
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .replace(/<tool_call>[\s\S]*/gi, '');
+
   // Pre-process [REF:id|title|date] into markdown links: [title](email-ref://id?date=date)
-  const processedContent = content.replace(
-    /\[REF:([^|\]]+)\|([^|\]]+)\|([^\]]*)\]/g,
-    (_, id, title, date) => `[${title}](email-ref://${id}?date=${encodeURIComponent(date || '')})`
+  // Also handles [REF:id\|title\|date] inside markdown tables where pipe characters are escaped
+  const processedContent = sanitizedContent.replace(
+    /\[REF:([^|\\\]]+)(?:\\?\|)([^|\\\]]+)(?:\\?\|)([^\]]*)\]/g,
+    (_, id, title, date) => `[${title.trim()}](email-ref://${id.trim()}?date=${encodeURIComponent((date || '').trim())})`
   );
 
   return (
     <div className={`markdown-body font-sans text-xs sm:text-[13px] leading-relaxed text-[var(--color-neutral-8)] ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={(url) => url}
         components={{
           h1: ({ node, ...props }) => (
             <h1 className="text-base sm:text-lg font-serif font-medium text-[var(--color-neutral-10)] mt-4 mb-2 pb-1.5 border-b border-[var(--color-border)]" {...props} />

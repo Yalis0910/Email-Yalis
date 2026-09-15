@@ -81,7 +81,7 @@ class AutoSyncScheduler:
         from app.services.imap_sync import GenericImapService
 
         async with get_db() as db:
-            cur = await db.execute("SELECT id, email, sync_status, refresh_token, account_type FROM accounts")
+            cur = await db.execute("SELECT id, email, sync_status, sync_message, last_synced_at, refresh_token, account_type FROM accounts")
             rows = await cur.fetchall()
 
         if not rows:
@@ -90,11 +90,31 @@ class AutoSyncScheduler:
         synced_accounts = []
         for row in rows:
             acc_id = row["id"]
-            # Skip if actively syncing already
-            if acc_id in SYNC_PROGRESS and SYNC_PROGRESS[acc_id].get("status") == "syncing":
-                continue
+            # Skip if actively syncing already in memory or async task registry
+            try:
+                from app.routers.sync import is_account_syncing
+                if is_account_syncing(acc_id):
+                    continue
+            except Exception:
+                if acc_id in SYNC_PROGRESS and SYNC_PROGRESS[acc_id].get("status") == "syncing":
+                    continue
+
             if row["sync_status"] == "syncing":
                 continue
+
+            # Anti-Lockout Cooldown: If account hit rate limit or connection limit, enforce safe cooling period
+            sync_msg = str(row["sync_message"] or "").lower()
+            if row["sync_status"] == "error" and ("频率" in sync_msg or "bandwidth" in sync_msg or "limit" in sync_msg or "simultaneous" in sync_msg or "连接数" in sync_msg):
+                last_time_str = row["last_synced_at"]
+                if last_time_str:
+                    try:
+                        last_dt = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+                        cooling_minutes = 15 if ("simultaneous" in sync_msg or "连接数" in sync_msg) else 60
+                        if datetime.now() - last_dt < timedelta(minutes=cooling_minutes):
+                            logger.info(f"AutoSync: Skipping account {row['email']} - in cooling window (wait >= {cooling_minutes} min, last at {last_time_str})")
+                            continue
+                    except Exception:
+                        pass
 
             has_refresh = bool(row["refresh_token"])
             try:

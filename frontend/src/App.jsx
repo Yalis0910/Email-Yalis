@@ -8,6 +8,7 @@ import MailSearch from './pages/MailSearch';
 import Settings from './pages/Settings';
 import AICopilotWorkbench from './pages/AICopilotWorkbench';
 import RBACManagement from './pages/RBACManagement';
+import SalesPlaybook from './pages/SalesPlaybook';
 import Login from './pages/Login';
 import GlobalAICopilotDrawer from './components/GlobalAICopilotDrawer';
 import EmailDetailModal from './components/EmailDetailModal';
@@ -30,6 +31,7 @@ function AppContent() {
   const isAutoSyncing = syncingAccountIds.some(id => !manualSyncAccountIds.includes(id));
   const [toastNotice, setToastNotice] = useState(null);
   const [targetEmailId, setTargetEmailId] = useState(null);
+  const [targetContact, setTargetContact] = useState(null);
   const [modalEmailId, setModalEmailId] = useState(null);
   const [isEmailModalOpen, setIsEmailModalOpen] = useState(false);
 
@@ -211,7 +213,7 @@ function AppContent() {
   }, [hasSyncing, isAuthenticated]);
 
   // Trigger sync for a single specific account
-  const handleTriggerSync = async (specificAccId = null, force = true) => {
+  const handleTriggerSync = async (specificAccId = null, force = false) => {
     const accId = specificAccId || selectedAccount || (accounts[0] && accounts[0].id);
     if (!accId) {
       alert('请先授权绑定或选择一个可用邮箱账号！');
@@ -228,7 +230,10 @@ function AppContent() {
       setSyncingAccountIds(prev => [...new Set([...prev, accId])]);
       setManualSyncAccountIds(prev => [...new Set([...prev, accId])]);
 
-      await api.triggerSync(accId, false, null, force);
+      const res = await api.triggerSync(accId, false, null, force);
+      if (res?.status === 'already_syncing') {
+        showToast(res.message || '该账号正在同步中，请稍候');
+      }
       listenAccountSync(accId, accEmail);
     } catch (err) {
       setSyncingAccountIds(prev => prev.filter(id => id !== accId));
@@ -343,6 +348,18 @@ function AppContent() {
     setModalEmailId(null);
   }, []);
 
+  const handleNavigate = useCallback((tab, params = {}) => {
+    if (params?.contact) {
+      setTargetContact(params.contact);
+    } else if (params?.contactId) {
+      setTargetContact({ id: params.contactId });
+    }
+    if (params?.emailId) {
+      setTargetEmailId(params.emailId);
+    }
+    setActiveTab(tab);
+  }, []);
+
   // 1. Loading screen
   if (isLoading) {
     return (
@@ -393,7 +410,7 @@ function AppContent() {
         {activeTab === 'dashboard' && hasPagePermission('dashboard') && (
           <Dashboard
             selectedAccount={selectedAccount}
-            onNavigate={(tab) => setActiveTab(tab)}
+            onNavigate={handleNavigate}
           />
         )}
 
@@ -415,7 +432,13 @@ function AppContent() {
           <ContactGraph
             selectedAccount={selectedAccount}
             onSelectEmail={handleSelectEmail}
+            initialContact={targetContact}
+            onClearInitialContact={() => setTargetContact(null)}
           />
+        )}
+
+        {activeTab === 'sales_playbook' && hasPagePermission('sales_playbook') && (
+          <SalesPlaybook />
         )}
 
         {activeTab === 'emails' && hasPagePermission('emails') && (
@@ -436,7 +459,7 @@ function AppContent() {
           <Settings
             accounts={accounts}
             loadAccounts={loadAccounts}
-            onTriggerSync={(accId) => handleTriggerSync(accId, true)}
+            onTriggerSync={(accId) => handleTriggerSync(accId, false)}
             onTriggerSyncAll={handleTriggerSyncAll}
             syncingAccountIds={syncingAccountIds}
             isSyncing={isSyncing}

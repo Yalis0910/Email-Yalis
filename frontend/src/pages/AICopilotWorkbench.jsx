@@ -1,33 +1,40 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Bot, 
   Sparkles, 
   Send, 
   RefreshCw, 
   Square, 
   Mail, 
-  ExternalLink, 
   Trash2, 
   Copy, 
-  Check,
-  Plus,
-  MessageSquare,
-  Clock,
-  ChevronRight,
-  PanelLeftClose,
-  PanelLeftOpen,
-  ChevronDown,
-  X
+  Check, 
+  Plus, 
+  MessageSquare, 
+  Clock, 
+  PanelLeftClose, 
+  PanelLeftOpen, 
+  ChevronDown, 
+  RotateCw, 
+  X,
+  Brain,
+  Search
 } from 'lucide-react';
 import { api } from '../api/client';
 import { useAIConversation } from '../context/AIConversationContext';
 import { useChatAutoScroll } from '../hooks/useChatAutoScroll';
 import MarkdownRenderer from '../components/MarkdownRenderer';
-import AgentToolCallsView from '../components/AgentToolCallsView';
-import ModelSelectorDropdown from '../components/ModelSelectorDropdown';
-import ThinkingModeSlider from '../components/ThinkingModeSlider';
-import ThinkingBlock from '../components/ThinkingBlock';
-import ContextTokenPopover from '../components/ContextTokenPopover';
+import DeepSeekThinkingBar from '../components/DeepSeekThinkingBar';
+import DeepSeekToolPill from '../components/DeepSeekToolPill';
+import DeepSeekInputIsland from '../components/DeepSeekInputIsland';
+import AIThinkingStatusCard from '../components/AIThinkingStatusCard';
+import DeepSeekCitedReferences from '../components/DeepSeekCitedReferences';
+
+const QUICK_PROMPTS = [
+  '🔍 帮我检索我最近成交订单的是哪一名客户',
+  '💳 统计我当前订阅的所有海外 SaaS 服务与开销',
+  '👥 提取最近往来最频繁的外贸客户与合作进展',
+  '💡 查询最近关于项目合同与发票收据的最新邮件'
+];
 
 function formatRelativeTime(dateStr) {
   if (!dateStr) return '';
@@ -49,12 +56,35 @@ function formatRelativeTime(dateStr) {
   return `${date.getFullYear()}-${m}-${d}`;
 }
 
-const QUICK_PROMPTS = [
-  '🔍 帮我查找最近的报销发票与电子账单',
-  '💳 统计我当前订阅的所有 SaaS 服务与花费',
-  '👥 总结最近往来最频繁的联系人与合作事项',
-  '🌐 联网检索某家服务商或技术平台的最新背景与官网'
-];
+function groupConversationsByDate(conversations) {
+  const groups = {
+    today: [],
+    past7Days: [],
+    older: []
+  };
+
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOf7DaysAgo = startOfToday - 7 * 86400 * 1000;
+
+  (conversations || []).forEach(conv => {
+    const rawTime = conv.updated_at || conv.created_at;
+    const time = rawTime ? new Date(rawTime.replace(' ', 'T')).getTime() : 0;
+    if (time >= startOfToday) {
+      groups.today.push(conv);
+    } else if (time >= startOf7DaysAgo) {
+      groups.past7Days.push(conv);
+    } else {
+      groups.older.push(conv);
+    }
+  });
+
+  return [
+    { label: '今天', items: groups.today },
+    { label: '前 7 天', items: groups.past7Days },
+    { label: '更早', items: groups.older }
+  ].filter(g => g.items.length > 0);
+}
 
 export default function AICopilotWorkbench({ selectedAccount, onSelectEmail }) {
   const {
@@ -73,6 +103,7 @@ export default function AICopilotWorkbench({ selectedAccount, onSelectEmail }) {
     newConversation,
     deleteConversation,
     sendMessage,
+    regenerateResponse,
     stopStreaming,
     clearCurrentMessages,
     activeContactContext,
@@ -86,24 +117,13 @@ export default function AICopilotWorkbench({ selectedAccount, onSelectEmail }) {
 
   const [input, setInput] = useState('');
   const [copiedIdx, setCopiedIdx] = useState(null);
-  const [aiConfig, setAiConfig] = useState(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-
-  const inputRef = useRef(null);
 
   // Sync draft prompt if invoked externally
   useEffect(() => {
     if (draftPrompt) {
       setInput(draftPrompt);
       setDraftPrompt('');
-      setTimeout(() => {
-        if (inputRef.current) {
-          inputRef.current.focus();
-          inputRef.current.style.height = 'auto';
-          const scrollH = inputRef.current.scrollHeight;
-          inputRef.current.style.height = `${Math.min(scrollH, 180)}px`;
-        }
-      }, 150);
     }
   }, [draftPrompt, setDraftPrompt]);
 
@@ -122,51 +142,10 @@ export default function AICopilotWorkbench({ selectedAccount, onSelectEmail }) {
     activeConvId
   });
 
-  useEffect(() => {
-    loadConfig();
-  }, []);
-
-  const loadConfig = async () => {
-    try {
-      const res = await api.getAISettings();
-      if (res && res.settings) {
-        setAiConfig(res.settings);
-      }
-    } catch (_) {}
-  };
-
-  const handleInputChange = (e) => {
-    const val = e.target.value;
-    setInput(val);
-    if (inputRef.current) {
-      inputRef.current.style.height = 'auto';
-      const scrollH = inputRef.current.scrollHeight;
-      const maxH = 180;
-      if (scrollH > maxH) {
-        inputRef.current.style.height = `${maxH}px`;
-        inputRef.current.style.overflowY = 'auto';
-      } else {
-        inputRef.current.style.height = `${scrollH}px`;
-        inputRef.current.style.overflowY = 'hidden';
-      }
-    }
-  };
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
   const handleSend = async (customText = null) => {
     const textToSend = (customText || input).trim();
     if (!textToSend || isStreaming) return;
     setInput('');
-    if (inputRef.current) {
-      inputRef.current.style.height = 'auto';
-      inputRef.current.style.overflowY = 'hidden';
-    }
     scrollToBottom('smooth');
     await sendMessage(textToSend, selectedAccount);
   };
@@ -188,445 +167,399 @@ export default function AICopilotWorkbench({ selectedAccount, onSelectEmail }) {
     return <MarkdownRenderer content={text} onSelectEmail={onSelectEmail} />;
   };
 
+  const groupedConversations = groupConversationsByDate(conversations);
+
   return (
-    <div className="max-w-6xl mx-auto space-y-4 pb-12">
+    <div className="max-w-7xl mx-auto space-y-4 pb-6">
       {/* Top Header Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[var(--color-border)] pb-3 pt-1">
         <div>
-          <div className="flex items-center gap-2">
-            <h1 className="text-2xl sm:text-3xl font-serif font-normal text-[var(--color-neutral-10)] tracking-tight">
-              AI 邮件资产助手工作台
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-xl sm:text-2xl font-serif font-medium text-[var(--color-neutral-10)] tracking-tight">
+              AI 邮件助手工作台
             </h1>
-            <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/20">
-              Copilot 2.0
-            </span>
           </div>
-          <p className="text-xs font-serif text-[var(--color-neutral-6)] mt-1">
-            基于本地 SQLite FTS5 全文索引与资产台账，支持多会话隔离、历史回顾与跨邮件引用溯源。
+          <p className="text-xs font-serif text-[var(--color-neutral-6)] mt-0.5">
+            深度集成本地 SQLite 全文索引、智能体工具链与外贸业务记忆，全景呈现思维链与真实引用数据。
           </p>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <ModelSelectorDropdown
-            currentModel={currentModel}
-            onSelectModel={setCurrentModel}
-            enabledModelGroups={enabledModelGroups}
-            dropUp={false}
-            compact={true}
-          />
         </div>
       </div>
 
-      {/* Main Container: Left Sidebar (History Sessions) + Right Chat Area */}
-      <div className="yohaku-card flex h-[calc(100vh-210px)] min-h-[560px] overflow-hidden p-0 border border-[var(--color-border)] rounded-xl shadow-xs">
-        {/* Left Sidebar: Conversations History */}
+      {/* Main Container: Left Sidebar (History Sessions) + Right DeepSeek Chat Viewport */}
+      <div className="yohaku-card flex h-[calc(100vh-170px)] min-h-[620px] overflow-hidden p-0 border border-[var(--color-border)] rounded-2xl shadow-sm bg-[var(--color-surface)] relative">
+        
+        {/* Left Sidebar: DeepSeek Style Session Groups & New Chat */}
         <div
           className={`${
             isSidebarOpen ? 'w-64 sm:w-72' : 'w-0'
           } transition-all duration-200 border-r border-[var(--color-border)] bg-[var(--color-surface-subtle)] flex flex-col shrink-0 overflow-hidden select-none`}
         >
-          {/* New Conversation Button */}
+          {/* Top New Conversation Button */}
           <div className="p-3 border-b border-[var(--color-border)]/60 bg-[var(--color-surface-subtle)]">
             <button
-              onClick={() => {
-                newConversation();
-                setTimeout(() => inputRef.current?.focus(), 100);
-              }}
-              className="w-full py-2 px-3 rounded-lg bg-[var(--color-accent)] text-white hover:opacity-95 text-xs sm:text-sm font-sans font-medium flex items-center justify-center gap-2 shadow-xs transition-all cursor-pointer"
+              onClick={() => newConversation()}
+              className="w-full py-2.5 px-3.5 rounded-xl bg-[var(--color-surface)] hover:bg-[var(--color-surface)]/80 text-[var(--color-neutral-9)] hover:text-[var(--color-accent)] border border-[var(--color-border)] hover:border-[var(--color-accent)]/40 text-xs sm:text-[13px] font-sans font-medium flex items-center justify-center gap-2 shadow-2xs hover:shadow-xs transition-all cursor-pointer group"
             >
-              <Plus className="w-4 h-4" />
-              <span>新建对话</span>
+              <Plus className="w-4 h-4 text-[var(--color-accent)] group-hover:rotate-90 transition-transform duration-200" />
+              <span>开启新对话</span>
             </button>
           </div>
 
-          {/* History List Section Header */}
-          <div className="px-3 pt-3 pb-1.5 flex items-center justify-between text-[11px] font-mono text-[var(--color-neutral-5)]">
-            <span className="flex items-center gap-1">
-              <Clock className="w-3 h-3" />
-              <span>历史对话 ({conversations.length})</span>
-            </span>
-          </div>
-
-          {/* History Scrollable List */}
-          <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-1">
+          {/* Grouped History List */}
+          <div className="flex-1 overflow-y-auto px-2.5 py-3 space-y-4 custom-scrollbar">
             {conversations.length === 0 ? (
-              <div className="py-12 text-center text-[var(--color-neutral-4)] text-xs font-serif">
+              <div className="py-16 text-center text-[var(--color-neutral-4)] text-xs font-serif">
                 暂无历史对话记录<br />
-                点击上方「新建对话」发起
+                点击上方「开启新对话」开始交流
               </div>
             ) : (
-              conversations.map((conv) => {
-                const isActive = conv.id === activeConvId;
-                return (
-                  <div
-                    key={conv.id}
-                    onClick={() => selectConversation(conv.id)}
-                    className={`group relative flex items-center justify-between px-3 py-2.5 rounded-lg text-xs cursor-pointer transition-all ${
-                      isActive
-                        ? 'bg-[var(--color-surface)] text-[var(--color-accent)] border border-[var(--color-accent)]/25 shadow-xs font-medium'
-                        : 'text-[var(--color-neutral-8)] hover:bg-[var(--color-surface)]/70 hover:text-[var(--color-neutral-10)]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
-                      <MessageSquare className={`w-3.5 h-3.5 shrink-0 ${isActive ? 'text-[var(--color-accent)]' : 'text-[var(--color-neutral-5)] group-hover:text-[var(--color-neutral-7)]'}`} />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate font-sans font-medium">
-                          {conv.title || '新对话'}
-                        </div>
-                        <div className="text-[10px] font-mono text-[var(--color-neutral-5)] mt-0.5 flex items-center gap-1.5">
-                          <span>{formatRelativeTime(conv.updated_at || conv.created_at)}</span>
-                          {conv.message_count > 0 && (
-                            <>
-                              <span>·</span>
-                              <span>{conv.message_count} 条</span>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Delete Icon */}
-                    <button
-                      onClick={(e) => handleDeleteSession(e, conv.id)}
-                      className="p-1 rounded text-[var(--color-neutral-4)] hover:text-rose-600 hover:bg-rose-50 transition-colors opacity-0 group-hover:opacity-100 shrink-0"
-                      title="删除对话"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+              groupedConversations.map((group) => (
+                <div key={group.label} className="space-y-1">
+                  <div className="px-2.5 py-1 text-[11px] font-mono font-medium text-[var(--color-neutral-4)]">
+                    {group.label}
                   </div>
-                );
-              })
+                  {group.items.map((conv) => {
+                    const isActive = conv.id === activeConvId;
+                    return (
+                      <div
+                        key={conv.id}
+                        onClick={() => selectConversation(conv.id)}
+                        className={`group relative flex items-center justify-between px-3 py-2 rounded-xl text-xs cursor-pointer transition-all ${
+                          isActive
+                            ? 'bg-[var(--color-surface)] text-[var(--color-accent)] font-medium border border-[var(--color-accent)]/30 shadow-2xs'
+                            : 'text-[var(--color-neutral-7)] hover:bg-[var(--color-surface)] hover:text-[var(--color-neutral-10)]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
+                          <MessageSquare className={`w-3.5 h-3.5 shrink-0 ${isActive ? 'text-[var(--color-accent)]' : 'text-[var(--color-neutral-4)] group-hover:text-[var(--color-neutral-6)]'}`} />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-sans text-xs">
+                              {conv.title || '新对话'}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Delete Session Icon */}
+                        <button
+                          onClick={(e) => handleDeleteSession(e, conv.id)}
+                          className="p-1 rounded text-[var(--color-neutral-4)] hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors opacity-0 group-hover:opacity-100 shrink-0 cursor-pointer"
+                          title="删除对话"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))
             )}
           </div>
         </div>
 
-        {/* Right Chat Pane */}
-        <div className="flex-1 flex flex-col min-w-0 bg-[var(--color-surface)]">
-          {/* Chat Window Header */}
-          <div className="px-4 py-2.5 border-b border-[var(--color-border)] flex items-center justify-between bg-[var(--color-surface)] shrink-0">
-            <div className="flex items-center gap-2 min-w-0">
+        {/* Right Chat Canvas: DeepSeek Flat Centered Stream with Floating Input Island */}
+        <div className="flex-1 flex flex-col min-w-0 bg-[var(--color-surface)] relative overflow-hidden">
+          
+          {/* Top Subtle Canvas Header */}
+          <div className="px-4 sm:px-6 py-2.5 border-b border-[var(--color-border)]/60 flex items-center justify-between bg-[var(--color-surface)] shrink-0 z-10">
+            <div className="flex items-center gap-2.5 min-w-0">
               <button
                 onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-                className="p-1.5 rounded text-[var(--color-neutral-6)] hover:bg-[var(--color-surface-subtle)] hover:text-[var(--color-neutral-9)] transition-colors"
-                title={isSidebarOpen ? '收起历史列表' : '展开历史列表'}
+                className="p-1.5 rounded-lg text-[var(--color-neutral-6)] hover:bg-[var(--color-surface-subtle)] hover:text-[var(--color-neutral-9)] transition-colors cursor-pointer"
+                title={isSidebarOpen ? '收起侧边栏' : '展开侧边栏'}
               >
                 {isSidebarOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
               </button>
+              
               <div className="min-w-0 flex items-center gap-2">
-                <span className="font-serif font-medium text-sm text-[var(--color-neutral-9)] truncate">
-                  {activeConversation ? activeConversation.title : (activeContactContext ? `👤 往来研讨：${activeContactContext.name}` : '新对话')}
+                <span className="font-serif font-medium text-xs sm:text-sm text-[var(--color-neutral-9)] truncate">
+                  {activeConversation ? activeConversation.title : (activeContactContext ? `👤 研讨: ${activeContactContext.name}` : '新对话')}
                 </span>
                 {activeConvId && (
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[var(--color-surface-subtle)] text-[var(--color-neutral-5)] border border-[var(--color-border)]">
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-[var(--color-surface-subtle)] text-[var(--color-neutral-5)] border border-[var(--color-border)]">
                     {messages.length} 轮互动
                   </span>
                 )}
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => newConversation()}
+                className="p-1.5 rounded-lg text-[var(--color-neutral-5)] hover:text-[var(--color-accent)] hover:bg-[var(--color-surface-subtle)] transition-colors cursor-pointer"
+                title="开启新对话"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
               <button
                 onClick={clearCurrentMessages}
-                className="p-1.5 rounded text-[var(--color-neutral-5)] hover:text-rose-600 hover:bg-[var(--color-surface-subtle)] transition-colors"
-                title="清空当前对话"
+                className="p-1.5 rounded-lg text-[var(--color-neutral-5)] hover:text-rose-600 hover:bg-[var(--color-surface-subtle)] transition-colors cursor-pointer"
+                title="清空当前消息"
               >
                 <Trash2 className="w-4 h-4" />
               </button>
             </div>
           </div>
 
-          {/* Messages Stream */}
-          <div className="relative flex-1 min-h-0 flex flex-col">
-            <div 
-              ref={containerRef}
-              onScroll={handleScroll}
-              onWheel={handleWheel}
-              onTouchStart={handleTouchStart}
-              onTouchMove={handleTouchMove}
-              className="flex-1 overflow-y-auto p-6 space-y-6"
-            >
+          {/* Centered Scrollable Messages Viewport (with generous bottom padding for floating input) */}
+          <div 
+            ref={containerRef}
+            onScroll={handleScroll}
+            onWheel={handleWheel}
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            className="flex-1 overflow-y-auto px-4 sm:px-6 pt-4 pb-48 custom-scrollbar"
+          >
+            <div className="max-w-3xl lg:max-w-4xl mx-auto w-full space-y-7">
               {isLoadingHistory ? (
-                <div className="flex flex-col items-center justify-center h-full text-center space-y-2 text-[var(--color-neutral-5)]">
+                <div className="flex flex-col items-center justify-center py-24 text-center space-y-2 text-[var(--color-neutral-5)]">
                   <RefreshCw className="w-6 h-6 animate-spin text-[var(--color-accent)]" />
                   <p className="text-xs font-mono">正在加载历史对话记录...</p>
                 </div>
               ) : messages.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-center space-y-4 text-[var(--color-neutral-5)] py-12">
-                  <img 
-                    src="/ai-avatar.png" 
-                    alt="AI Avatar" 
-                    className="w-16 h-16 rounded-full object-cover border-2 border-[var(--color-accent)]/30 shadow-sm" 
-                  />
-                  <div className="space-y-1">
-                    <h3 className="text-base font-serif font-medium text-[var(--color-neutral-9)]">
+                /* DeepSeek Clean Greeting State */
+                <div className="flex flex-col items-center justify-center py-16 sm:py-24 text-center space-y-6">
+                  <div className="relative">
+                    <img 
+                      src="/ai-avatar.png" 
+                      alt="AI Avatar" 
+                      className="w-14 h-14 sm:w-16 sm:h-16 rounded-full object-cover border-2 border-[var(--color-accent)]/30 shadow-md" 
+                    />
+                    <span className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-[var(--color-surface)] border border-[var(--color-border)] flex items-center justify-center shadow-xs">
+                      <Sparkles className="w-3 h-3 text-[var(--color-accent)]" />
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <h3 className="text-base sm:text-lg font-serif font-medium text-[var(--color-neutral-10)]">
                       您好！我是您的 AI 邮件资产助手
                     </h3>
-                    <p className="text-xs font-serif max-w-md mx-auto text-[var(--color-neutral-6)]">
-                      您可以向我提问关于邮件往来、消费账单、SaaS 账号与联系人合作的任何问题。
+                    <p className="text-xs font-serif max-w-md mx-auto text-[var(--color-neutral-6)] leading-relaxed">
+                      基于本地全量邮件与数字资产数据库，随时为您查询客户往来、订单确认、账单发票与深度数据分析。
                     </p>
                   </div>
 
-                  {/* Quick Prompts */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-xl w-full pt-4">
+                  {/* DeepSeek Quick Prompts Cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-w-xl w-full pt-2">
                     {QUICK_PROMPTS.map((prompt, idx) => (
                       <button
                         key={idx}
                         onClick={() => handleSend(prompt)}
-                        className="p-3 text-left text-xs font-sans rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-subtle)]/60 hover:bg-[var(--color-surface-subtle)] hover:border-[var(--color-accent)]/40 text-[var(--color-neutral-8)] hover:text-[var(--color-accent)] transition-all cursor-pointer shadow-2xs"
+                        className="p-3 text-left text-xs font-sans rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-subtle)]/60 hover:bg-[var(--color-surface)] hover:border-[var(--color-accent)]/50 text-[var(--color-neutral-8)] hover:text-[var(--color-neutral-10)] transition-all cursor-pointer shadow-2xs hover:shadow-xs group"
                       >
-                        {prompt}
+                        <span className="group-hover:translate-x-0.5 inline-block transition-transform">
+                          {prompt}
+                        </span>
                       </button>
                     ))}
                   </div>
                 </div>
               ) : (
+                /* DeepSeek Flat Message Stream */
                 <>
                   {activeConversation?.context_summary && (
                     <div className="flex items-center justify-center my-3 animate-in fade-in duration-200">
                       <div className="px-3.5 py-1.5 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-accent-border)]/60 text-[11px] font-mono text-[var(--color-neutral-7)] flex items-center gap-2 shadow-2xs">
                         <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                        <span>⚡ 上下文已智能语义压缩 · 早期历史已提炼为记忆摘要</span>
+                        <span>⚡ 上下文已智能语义压缩 · 早期历史已提炼为长效记忆</span>
                       </div>
                     </div>
                   )}
+
                   {messages.map((m, idx) => {
+                    const isCurrentStreaming = isStreaming && idx === messages.length - 1;
                     const hasAssistantContent = Boolean(
-                    (m.content && m.content.trim()) ||
-                    m.thinking_content ||
-                    m.is_thinking ||
-                    (m.tool_calls && m.tool_calls.length > 0) ||
-                    (m.references && m.references.length > 0)
-                  );
+                      (m.content && m.content.trim()) ||
+                      m.thinking_content ||
+                      m.is_thinking ||
+                      (m.tool_calls && m.tool_calls.length > 0) ||
+                      (m.references && m.references.length > 0) ||
+                      isCurrentStreaming ||
+                      m.stream_status === 'stopped' ||
+                      m.stream_status === 'error'
+                    );
 
-                  if (m.role === 'assistant' && !hasAssistantContent) {
-                    return null;
-                  }
+                    if (m.role === 'assistant' && !hasAssistantContent) {
+                      return null;
+                    }
 
-                  return (
-                    <div
-                      key={m.id || idx}
-                      className={`flex gap-3.5 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                    >
-                      {m.role === 'assistant' && (
-                        <img 
-                          src="/ai-avatar.png" 
-                          alt="AI Avatar" 
-                          className="w-8 h-8 rounded-full object-cover border border-[var(--color-accent)]/30 shadow-xs shrink-0 mt-0.5" 
-                        />
-                      )}
-
-                      <div className={`max-w-[85%] rounded-xl p-4 space-y-3 ${
-                        m.role === 'user'
-                          ? 'user-message-bubble bg-[var(--color-accent)] text-white shadow-sm selection:bg-white selection:text-[#141312]'
-                          : 'bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[var(--color-neutral-10)]'
-                      }`}>
-                        {m.role === 'assistant' ? (
-                          <div>
-                            {/* Thinking Process Block (Collapsible) */}
-                            {(m.thinking_content || m.is_thinking) && (
-                              <ThinkingBlock
-                                thinkingContent={m.thinking_content}
-                                isThinking={m.is_thinking}
-                                duration={m.thinking_duration}
-                              />
-                            )}
-
-                            {/* Agent Tool Calls Section */}
-                            {m.tool_calls && m.tool_calls.length > 0 && (
-                              <AgentToolCallsView toolCalls={m.tool_calls} />
-                            )}
-                            {renderMessageContent(m.content)}
-
-                            {/* Cited references */}
-                            {m.references && m.references.length > 0 && (
-                              <div className="mt-4 pt-3 border-t border-[var(--color-border)]/70">
-                                <div className="text-[11px] font-mono text-[var(--color-neutral-6)] mb-2 flex items-center gap-1.5">
-                                  <Mail className="w-3 h-3 text-[var(--color-accent)]" />
-                                  <span>相关本地邮件引用 ({m.references.length} 项，点击查看正文):</span>
-                                </div>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                                  {m.references.map((ref) => (
-                                    <div
-                                      key={ref.id}
-                                      onClick={() => onSelectEmail && onSelectEmail(ref.id)}
-                                      className="p-2 rounded-md bg-[var(--color-surface)] border border-[var(--color-border)] hover:border-[var(--color-accent)] cursor-pointer transition-all text-left group"
-                                    >
-                                      <div className="text-xs font-medium text-[var(--color-neutral-9)] group-hover:text-[var(--color-accent)] truncate">
-                                        {ref.subject}
-                                      </div>
-                                      <div className="text-[10px] font-mono text-[var(--color-neutral-5)] truncate mt-0.5 flex items-center justify-between">
-                                        <span>{ref.from}</span>
-                                        <span className="tabular-nums">{ref.date}</span>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-
-                            {/* Message Actions - only show when content is present */}
-                            {m.content && m.content.trim().length > 0 && (
-                              <div className="mt-2.5 pt-1 flex items-center justify-end">
-                                <button
-                                  onClick={() => handleCopyMessage(m.content, idx)}
-                                  className="text-[10px] font-mono text-[var(--color-neutral-5)] hover:text-[var(--color-accent)] flex items-center gap-1 cursor-pointer"
-                                >
-                                  {copiedIdx === idx ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                                  <span>{copiedIdx === idx ? '已复制' : '复制回答'}</span>
-                                </button>
-                              </div>
-                            )}
+                    if (m.role === 'user') {
+                      /* DeepSeek Style User Message Bubble */
+                      return (
+                        <div key={m.id || idx} className="flex justify-end my-3">
+                          <div className="max-w-[85%] sm:max-w-[78%] rounded-2xl px-4 py-2.5 bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[var(--color-neutral-9)] text-xs sm:text-[13px] leading-relaxed shadow-2xs">
+                            <div className="whitespace-pre-wrap font-sans select-text">{m.content}</div>
                           </div>
-                        ) : (
-                          <div className="whitespace-pre-wrap leading-relaxed text-sm font-sans">{m.content}</div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-                </>
-              )}
+                        </div>
+                      );
+                    }
 
-              {isStreaming && !messages.some(m => m.role === 'assistant' && (
-                (m.content && m.content.trim()) ||
-                m.thinking_content ||
-                m.is_thinking ||
-                (m.tool_calls && m.tool_calls.length > 0)
-              )) && (
-                <div className="flex items-center gap-3 animate-in fade-in duration-200 pl-0.5">
-                  <img 
-                    src="/ai-avatar.png" 
-                    alt="AI Avatar" 
-                    className="w-8 h-8 rounded-full object-cover border border-[var(--color-accent)]/30 shadow-xs shrink-0 mt-0.5" 
-                  />
-                  <div className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-xs font-mono text-[var(--color-neutral-6)] shadow-2xs">
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--color-accent)]" />
-                    <span>Copilot 正在检索分析并生成回答...</span>
-                  </div>
-                </div>
+                    /* DeepSeek Style Flat Assistant Message */
+                    return (
+                      <div key={m.id || idx} className="my-5 select-text">
+                        {/* Assistant Header: Avatar + Label */}
+                        <div className="flex items-center gap-2 mb-2">
+                          <img 
+                            src="/ai-avatar.png" 
+                            alt="AI Avatar" 
+                            className="w-6 h-6 rounded-full object-cover border border-[var(--color-accent)]/30 shadow-2xs" 
+                          />
+                          <span className="text-xs font-serif font-medium text-[var(--color-neutral-9)]">
+                            AI 邮件资产助手
+                          </span>
+                          {currentModel && (
+                            <span className="text-[10px] font-mono text-[var(--color-neutral-4)] px-1.5 py-0.2 rounded bg-[var(--color-surface-subtle)] border border-[var(--color-border)]/60">
+                              {currentModel}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Flat Body Container (No Card Borders!) */}
+                        <div className="pl-8 space-y-3">
+                          {/* DeepSeek R1 Thinking Bar */}
+                          {(m.thinking_content || m.is_thinking) && (
+                            <DeepSeekThinkingBar
+                              thinkingContent={m.thinking_content}
+                              isThinking={m.is_thinking}
+                              duration={m.thinking_duration}
+                              defaultExpanded={Boolean(m.is_thinking)}
+                            />
+                          )}
+
+                          {/* DeepSeek Search / Tool Execution Pill */}
+                          {m.tool_calls && m.tool_calls.length > 0 && (
+                            <DeepSeekToolPill
+                              toolCalls={m.tool_calls}
+                              references={m.references || []}
+                              isStreaming={isCurrentStreaming}
+                              hasContent={Boolean(m.content && m.content.trim())}
+                            />
+                          )}
+
+                          {/* Active Status Card (analyzing, synthesizing, stopped, error) */}
+                          {((isCurrentStreaming && (!m.content || !m.content.trim()) && !m.is_thinking) || (m.stream_status === 'stopped' || m.stream_status === 'error')) && (
+                            <AIThinkingStatusCard
+                              streamStatus={m.stream_status || (m.tool_calls?.length > 0 ? 'synthesizing' : 'analyzing')}
+                              statusMessage={m.status_message}
+                              startedAt={m.started_at}
+                              isStreaming={isCurrentStreaming}
+                              hasContent={Boolean(m.content && m.content.trim())}
+                              toolCalls={m.tool_calls || []}
+                              references={m.references || []}
+                              onStop={isCurrentStreaming ? stopStreaming : null}
+                              onRetry={() => regenerateResponse(idx, selectedAccount)}
+                            />
+                          )}
+
+                          {/* Pure Flat Markdown Answer */}
+                          {m.content && m.content.trim().length > 0 && (
+                            <div className="relative font-sans text-xs sm:text-[13px] leading-relaxed text-[var(--color-neutral-9)]">
+                              {renderMessageContent(m.content)}
+                              {isCurrentStreaming && (
+                                <span className="inline-block w-1.5 h-4 ml-1 bg-[var(--color-accent)] animate-pulse align-middle" />
+                              )}
+                            </div>
+                          )}
+
+                          {/* DeepSeek Cited References Shelf & Collapsible Grid */}
+                          {m.references && m.references.length > 0 && (
+                            <DeepSeekCitedReferences
+                              references={m.references}
+                              messageContent={m.content}
+                              onSelectEmail={onSelectEmail}
+                              isDrawer={false}
+                            />
+                          )}
+
+                          {/* Bottom Action Row (Copy, Regenerate, Duration) */}
+                          {!isCurrentStreaming && (m.content || m.tool_calls?.length > 0) && (
+                            <div className="mt-2.5 pt-1.5 flex items-center justify-between text-[11px] font-mono text-[var(--color-neutral-4)] select-none">
+                              <div className="flex items-center gap-2">
+                                {m.total_duration ? (
+                                  <span>耗时 {m.total_duration}s</span>
+                                ) : (m.thinking_duration > 0 ? (
+                                  <span>思考 {m.thinking_duration}s</span>
+                                ) : null)}
+                                {m.is_interrupted && (
+                                  <span className="text-amber-600 bg-amber-500/10 px-1.5 py-0.2 rounded font-sans text-[10px]">
+                                    已中止
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="flex items-center gap-3">
+                                <button
+                                  type="button"
+                                  onClick={() => regenerateResponse(idx, selectedAccount)}
+                                  className="hover:text-[var(--color-accent)] flex items-center gap-1 cursor-pointer transition-colors"
+                                  title="以此轮问题重新生成回答"
+                                >
+                                  <RotateCw className="w-3 h-3" />
+                                  <span>重新生成</span>
+                                </button>
+
+                                {m.content && m.content.trim().length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopyMessage(m.content, idx)}
+                                    className="hover:text-[var(--color-accent)] flex items-center gap-1 cursor-pointer transition-colors"
+                                  >
+                                    {copiedIdx === idx ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                                    <span>{copiedIdx === idx ? '已复制' : '复制回答'}</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
               )}
 
               <div ref={messagesEndRef} />
             </div>
-
-            {/* Quick Scroll to Bottom Floating Button */}
-            {showScrollBottom && (
-              <button
-                type="button"
-                onClick={() => scrollToBottom('smooth')}
-                className="absolute bottom-4 right-8 z-20 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[var(--color-surface)] border border-[var(--color-border)] shadow-md hover:shadow-xl text-xs font-mono text-[var(--color-neutral-8)] hover:text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-all cursor-pointer group animate-in fade-in zoom-in-95 duration-150"
-                title="回到底部"
-              >
-                <ChevronDown className="w-3.5 h-3.5 group-hover:translate-y-0.5 transition-transform" />
-                <span>回到底部</span>
-                {isStreaming && (
-                  <span className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-ping" />
-                )}
-              </button>
-            )}
           </div>
 
-          {/* Input Bar */}
-          <div className="p-4 border-t border-[var(--color-border)] bg-[var(--color-surface)] space-y-2.5">
-            {/* Input Toolbar */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <ModelSelectorDropdown
-                  currentModel={currentModel}
-                  onSelectModel={setCurrentModel}
-                  enabledModelGroups={enabledModelGroups}
-                  dropUp={true}
-                  compact={false}
-                />
-                <ThinkingModeSlider
-                  thinkingLevel={thinkingLevel}
-                  onSelectLevel={setThinkingLevel}
-                  dropUp={true}
-                  compact={false}
-                />
-                <ContextTokenPopover
-                  stats={contextStats}
-                  isCompressing={isCompressing}
-                  onCompress={compressActiveConversation}
-                  dropUp={true}
-                  compact={false}
-                />
-              </div>
-              <div className="text-[11px] font-mono text-[var(--color-neutral-4)]">
-                <span>Shift + Enter 换行 · Enter 发送</span>
-              </div>
-            </div>
-
-            {/* Active Contact Background Reference Pill */}
-            {activeContactContext && (
-              <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-[var(--color-accent-soft)]/70 border border-[var(--color-accent-border)] text-xs font-mono animate-in fade-in slide-in-from-bottom-1 duration-150">
-                <div className="flex items-center gap-2 min-w-0 pr-2">
-                  <span className="text-sm shrink-0">📌</span>
-                  <div className="min-w-0 flex items-center gap-2 flex-wrap">
-                    <span className="text-xs text-[var(--color-neutral-5)]">引用背景:</span>
-                    <span className="font-medium text-[var(--color-accent)] truncate max-w-[150px]" title={activeContactContext.name}>
-                      {activeContactContext.name}
-                    </span>
-                    {activeContactContext.email && (
-                      <span className="text-xs text-[var(--color-neutral-6)] truncate max-w-[200px]" title={activeContactContext.email}>
-                        &lt;{activeContactContext.email}&gt;
-                      </span>
-                    )}
-                    <span className="px-2 py-0.5 rounded bg-[var(--color-surface)] text-[11px] text-[var(--color-neutral-7)] border border-[var(--color-border)] shrink-0">
-                      共 {activeContactContext.total_count || 0} 封往来
-                    </span>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={clearContactContext}
-                  className="p-1 rounded text-[var(--color-neutral-5)] hover:text-rose-600 hover:bg-[var(--color-surface)] transition-colors shrink-0 cursor-pointer"
-                  title="解除联系人背景引用"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            )}
-
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSend();
-              }}
-              className="flex items-end gap-3"
+          {/* Quick Scroll to Bottom Floating Button */}
+          {showScrollBottom && (
+            <button
+              type="button"
+              onClick={() => scrollToBottom('smooth')}
+              className="absolute bottom-40 right-8 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[var(--color-surface)] border border-[var(--color-border)] shadow-md hover:shadow-xl text-xs font-mono text-[var(--color-neutral-8)] hover:text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-all cursor-pointer group animate-in fade-in zoom-in-95 duration-150"
+              title="回到底部"
             >
-              <textarea
-                ref={inputRef}
-                rows={1}
-                value={input}
-                onChange={handleInputChange}
-                onKeyDown={handleKeyDown}
-                placeholder="向本地邮件库提问（例如：帮我汇总上个月在海外服务器上的所有扣费记录与发票）..."
-                className="flex-1 px-4 py-2.5 text-xs sm:text-sm font-sans rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-neutral-10)] focus:outline-none focus:border-[var(--color-accent)] shadow-xs placeholder:text-[var(--color-neutral-4)] resize-none leading-relaxed transition-[height] duration-75 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[var(--color-neutral-3)] hover:[&::-webkit-scrollbar-thumb]:bg-[var(--color-neutral-4)]"
-                style={{ minHeight: '44px', maxHeight: '180px', overflowY: 'hidden' }}
-              />
-
-              {isStreaming ? (
-                <button
-                  type="button"
-                  onClick={stopStreaming}
-                  className="h-[44px] px-4 rounded-lg bg-rose-600 text-white text-xs font-mono flex items-center gap-1.5 shadow-sm hover:bg-rose-700 transition-all shrink-0 cursor-pointer"
-                >
-                  <Square className="w-3.5 h-3.5" />
-                  <span>中止</span>
-                </button>
-              ) : (
-                <button
-                  type="submit"
-                  disabled={!input.trim()}
-                  className="h-[44px] yohaku-btn-primary px-5 text-xs sm:text-sm font-mono flex items-center gap-2 shadow-sm disabled:opacity-40 transition-all shrink-0 cursor-pointer"
-                >
-                  <Send className="w-4 h-4" />
-                  <span>发送</span>
-                </button>
+              <ChevronDown className="w-3.5 h-3.5 group-hover:translate-y-0.5 transition-transform" />
+              <span>回到底部</span>
+              {isStreaming && (
+                <span className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-ping" />
               )}
-            </form>
+            </button>
+          )}
+
+          {/* DeepSeek Signature Floating Multi-functional Input Island with Gradient Fade */}
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col justify-end pb-3 pt-12 bg-gradient-to-t from-[var(--color-surface)] via-[var(--color-surface)]/90 to-transparent">
+            <div className="pointer-events-auto">
+              <DeepSeekInputIsland
+                input={input}
+                setInput={setInput}
+                onSend={handleSend}
+                isStreaming={isStreaming}
+                onStop={stopStreaming}
+                currentModel={currentModel}
+                onSelectModel={setCurrentModel}
+                enabledModelGroups={enabledModelGroups}
+                thinkingLevel={thinkingLevel}
+                onSelectThinkingLevel={setThinkingLevel}
+                contextStats={contextStats}
+                isCompressing={isCompressing}
+                onCompress={compressActiveConversation}
+                activeContactContext={activeContactContext}
+                onClearContactContext={clearContactContext}
+              />
+            </div>
           </div>
+
         </div>
       </div>
     </div>

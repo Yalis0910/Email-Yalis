@@ -369,10 +369,7 @@ class StatsService:
                                 if c_data['last_ts'] is None or ts > c_data['last_ts']:
                                     c_data['last_ts'] = ts
 
-                # Delete existing contacts for this account
-                await db.execute("DELETE FROM contacts WHERE account_id = ?", (acc_id,))
-
-                # Insert fresh, 100% accurate contacts
+                # Insert or update contacts using UPSERT to prevent cascading deletes of AI reports and deal reviews
                 insert_rows = []
                 for c_email, c_data in contacts_map.items():
                     cnt_id = f"cnt_{acc_id}_{hashlib.md5(c_email.encode()).hexdigest()[:10]}"
@@ -399,11 +396,35 @@ class StatsService:
                     ))
 
                 if insert_rows:
+                    # Clean up obsolete contacts that no longer have emails AND have no reports/reviews/custom data
+                    placeholders = ','.join(['?'] * len(insert_rows))
+                    all_emails = [r[2] for r in insert_rows]
+                    await db.execute(f"""
+                        DELETE FROM contacts 
+                        WHERE account_id = ? 
+                          AND email NOT IN ({placeholders})
+                          AND id NOT IN (SELECT contact_id FROM contact_ai_reports)
+                          AND id NOT IN (SELECT contact_id FROM deal_reviews)
+                          AND tier_locked = 0
+                    """, [acc_id] + all_emails)
+
                     await db.executemany("""
                         INSERT INTO contacts (
                             id, account_id, email, name, domain, inbound_count, outbound_count,
                             first_interaction, last_interaction, weight
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_id, email) DO UPDATE SET
+                            name = CASE 
+                                WHEN excluded.name IS NOT NULL AND excluded.name != '' AND (contacts.name IS NULL OR contacts.name = '' OR length(excluded.name) >= length(contacts.name))
+                                THEN excluded.name 
+                                ELSE contacts.name 
+                            END,
+                            domain = excluded.domain,
+                            inbound_count = excluded.inbound_count,
+                            outbound_count = excluded.outbound_count,
+                            first_interaction = excluded.first_interaction,
+                            last_interaction = excluded.last_interaction,
+                            weight = excluded.weight
                     """, insert_rows)
 
                 await db.commit()

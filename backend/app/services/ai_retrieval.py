@@ -42,10 +42,14 @@ async def detect_query_intent(query: str, extracted_emails: List[str]) -> Dict[s
         "email_content": True
     }
 
-async def search_context_for_query(query: str, account_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+async def search_context_for_query(
+    query: str, 
+    account_id: Optional[str] = None,
+    history: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[str, List[Dict[str, Any]]]:
     """
     High-precision hybrid retrieval:
-    1. Entity Extraction: extract emails & match contact names
+    1. Entity Extraction: extract emails & match contact names (with multi-turn context support)
     2. Targeted Bi-directional Email & Contact Retrieval: query both inbound & outbound emails directly
     3. Financial & Subscriptions context if intent detected
     4. General FTS5 / LIKE keyword search for email content
@@ -53,6 +57,24 @@ async def search_context_for_query(query: str, account_id: Optional[str] = None)
     Returns (context_prompt_str, referenced_emails)
     """
     extracted_emails = extract_emails(query)
+
+    # Multi-turn context resolution: if current query has pronoun/anaphoric intent,
+    # inspect recent history to extract contacts, emails, or references
+    pronoun_markers = [
+        "这名", "这位", "该客户", "这个客户", "该联系人", "他", "她", "对方", "这个人", 
+        "邮箱是什么", "联系方式", "是谁", "刚才说的", "上面说的", "上次", "丢单客户", "上一笔", "为什么会"
+    ]
+    has_pronoun = any(p in query for p in pronoun_markers)
+    if (has_pronoun or not extracted_emails) and history:
+        for h in reversed(history[-3:]):
+            h_text = h.get("content", "")
+            if not h_text:
+                continue
+            h_emails = extract_emails(h_text)
+            for he in h_emails:
+                if he not in extracted_emails:
+                    extracted_emails.append(he)
+
     intent = await detect_query_intent(query, extracted_emails)
     
     context_sections = []
@@ -81,7 +103,7 @@ async def search_context_for_query(query: str, account_id: Optional[str] = None)
                 if r["id"] not in [tc["id"] for tc in targeted_contacts]:
                     targeted_contacts.append(r)
 
-        # If no email in query, check if any contact name appears in query
+        # If no email in query, check if any contact name appears in query or recent history
         if not targeted_contacts:
             all_c_cur = await db.execute(f"""
                 SELECT id, account_id, email, name, domain, inbound_count, outbound_count, 
@@ -92,10 +114,25 @@ async def search_context_for_query(query: str, account_id: Optional[str] = None)
             """, acc_params)
             all_c_rows = await all_c_cur.fetchall()
             for r in all_c_rows:
-                if r["name"] and r["name"].strip() and r["name"].strip().lower() in query.lower():
+                c_name = r["name"].strip().lower() if r["name"] else ""
+                if c_name and c_name in query.lower():
                     targeted_contacts.append(r)
                     if r["email"].lower() not in extracted_emails:
                         extracted_emails.append(r["email"].lower())
+
+            # If still not found and query has anaphoric intent, check recent history for contact names
+            if not targeted_contacts and has_pronoun and history:
+                for h in reversed(history[-3:]):
+                    h_text = (h.get("content", "") or "").lower()
+                    for r in all_c_rows:
+                        c_name = r["name"].strip().lower() if r["name"] else ""
+                        if c_name and len(c_name) >= 3 and c_name in h_text:
+                            if r["id"] not in [tc["id"] for tc in targeted_contacts]:
+                                targeted_contacts.append(r)
+                                if r["email"].lower() not in extracted_emails:
+                                    extracted_emails.append(r["email"].lower())
+                    if targeted_contacts:
+                        break
 
         # If targeted contacts found, build contact info & check cached AI report
         if targeted_contacts:
@@ -299,7 +336,7 @@ async def search_context_for_query(query: str, account_id: Optional[str] = None)
                         body_sample = body_sample[:400] + "..."
                     general_lines.append(
                         f"- [REF:{m['id']}|{m['subject'] or '(无主题)'}|{m['date_str']}]\n"
-                        f"  发件人: {ref_info['from']} | 收件人: {m.get('to_emails', '')} | 日期: {m['date_str']}\n"
+                        f"  发件人: {ref_info['from']} | 收件人: {m['to_emails'] if ('to_emails' in m.keys()) else ''} | 日期: {m['date_str']}\n"
                         f"  主题: {m['subject'] or '(无主题)'}\n"
                         f"  内容摘要: {body_sample}"
                     )
@@ -322,36 +359,42 @@ async def search_context_for_query(query: str, account_id: Optional[str] = None)
                 )
         else:
             # Only if this is an open-ended general query and completely empty, pull recent emails
+            is_broad_recent_query = any(w in query for w in ["最新", "最近来信", "近况", "收件箱", "未读", "今天", "最近邮件", "近几天"]) and not any(p in query for p in ["这名", "这个", "该", "他是谁", "邮箱是什么", "联系方式", "谁是", "哪位", "为什么", "怎么回事"])
             if not referenced_emails and not context_sections:
-                cursor = await db.execute(f"""
-                    SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text
-                    FROM emails
-                    {"WHERE " + acc_filter[:-5] if acc_filter else ""}
-                    ORDER BY date_timestamp DESC LIMIT 5
-                """, acc_params)
-                recent_emails = await cursor.fetchall()
-                if recent_emails:
-                    recent_lines = ["【本地最新接收邮件（通用参考）】:"]
-                    for m in recent_emails:
-                        if m["id"] not in existing_ref_ids:
-                            existing_ref_ids.add(m["id"])
-                            ref_info = {
-                                "id": m["id"],
-                                "subject": m["subject"] or "(无主题)",
-                                "from": f"{m['from_name']} <{m['from_email']}>" if m['from_name'] else m['from_email'],
-                                "date": m["date_str"] or ""
-                            }
-                            referenced_emails.append(ref_info)
-                            body_sample = (m["body_text"] or m["snippet"] or "").strip().replace("\r", " ").replace("\n", " ")
-                            if len(body_sample) > 300:
-                                body_sample = body_sample[:300] + "..."
-                            recent_lines.append(
-                                f"- [REF:{m['id']}|{m['subject'] or '(无主题)'}|{m['date_str']}]\n"
-                                f"  发件人: {ref_info['from']} | 日期: {m['date_str']}\n"
-                                f"  主题: {m['subject'] or '(无主题)'}\n"
-                                f"  内容摘要: {body_sample}"
-                            )
-                    context_sections.append("\n".join(recent_lines))
+                if is_broad_recent_query:
+                    cursor = await db.execute(f"""
+                        SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text
+                        FROM emails
+                        {"WHERE " + acc_filter[:-5] if acc_filter else ""}
+                        ORDER BY date_timestamp DESC LIMIT 5
+                    """, acc_params)
+                    recent_emails = await cursor.fetchall()
+                    if recent_emails:
+                        recent_lines = ["【本地最新接收邮件（通用参考）】:"]
+                        for m in recent_emails:
+                            if m["id"] not in existing_ref_ids:
+                                existing_ref_ids.add(m["id"])
+                                ref_info = {
+                                    "id": m["id"],
+                                    "subject": m["subject"] or "(无主题)",
+                                    "from": f"{m['from_name']} <{m['from_email']}>" if m['from_name'] else m['from_email'],
+                                    "date": m["date_str"] or ""
+                                }
+                                referenced_emails.append(ref_info)
+                                body_sample = (m["body_text"] or m["snippet"] or "").strip().replace("\r", " ").replace("\n", " ")
+                                if len(body_sample) > 300:
+                                    body_sample = body_sample[:300] + "..."
+                                recent_lines.append(
+                                    f"- [REF:{m['id']}|{m['subject'] or '(无主题)'}|{m['date_str']}]\n"
+                                    f"  发件人: {ref_info['from']} | 日期: {m['date_str']}\n"
+                                    f"  主题: {m['subject'] or '(无主题)'}\n"
+                                    f"  内容摘要: {body_sample}"
+                                )
+                        context_sections.append("\n".join(recent_lines))
+                else:
+                    context_sections.append(
+                        "【系统检索明确反馈】：根据当前提问关键词，在本地邮件库中未检索到直接匹配的收发信记录。"
+                    )
 
     full_context = "\n\n".join(context_sections)
     return full_context, referenced_emails

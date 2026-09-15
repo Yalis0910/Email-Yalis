@@ -13,6 +13,7 @@ async def list_contacts(
     account_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("weight", pattern="^(weight|recent)$"),
+    tier: Optional[str] = Query(None), # 'A', 'B', 'C', 'D', 'overdue'
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -34,6 +35,14 @@ async def list_contacts(
         conditions.append(f"account_id IN ({placeholders})")
         params.extend(list(authorized))
 
+    if tier:
+        clean_tier = tier.strip()
+        if clean_tier == "overdue":
+            conditions.append("((tier = 'A' AND (julianday('now', 'localtime') - julianday(replace(last_interaction, 'T', ' '))) >= 3) OR (tier = 'B' AND (julianday('now', 'localtime') - julianday(replace(last_interaction, 'T', ' '))) >= 7))")
+        elif clean_tier in ["A", "B", "C", "D"]:
+            conditions.append("tier = ?")
+            params.append(clean_tier)
+
     if search:
         conditions.append("(name LIKE ? OR email LIKE ? OR domain LIKE ?)")
         pat = f"%{search.strip()}%"
@@ -51,7 +60,8 @@ async def list_contacts(
 
         query = f"""
             SELECT id, account_id, email, name, domain, inbound_count, outbound_count,
-                   first_interaction, last_interaction, weight
+                   first_interaction, last_interaction, weight, tier, tier_reason,
+                   tier_locked, deal_stage, estimated_value, last_follow_up_at
             FROM contacts
             {where_clause}
             {order_clause}
@@ -126,10 +136,12 @@ async def get_contact_timeline(
 
         order_sql = "ORDER BY date_timestamp DESC" if order == "desc" else "ORDER BY date_timestamp ASC"
 
+        # Performance optimization: omit body_html (often multi-megabytes of HTML/base64)
+        # and truncate body_text for inline preview to ensure sub-100ms response times.
         query = f"""
             SELECT id, account_id, thread_id, subject, from_name, from_email,
                    to_emails, cc_emails, date_timestamp, date_str, snippet,
-                   body_text, body_html, labels, has_attachments, size_estimate,
+                   substr(body_text, 1, 2000) as body_text, labels, has_attachments, size_estimate,
                    strftime('%Y-%m-%d %H:%M', date_timestamp / 1000, 'unixepoch', 'localtime') as formatted_date
             FROM emails
             {where_sql}
@@ -140,20 +152,23 @@ async def get_contact_timeline(
             email_rows = await cur.fetchall()
             emails = [dict(r) for r in email_rows]
 
-        # Attachments map for these emails
-        email_ids = [e["id"] for e in emails]
+        # Attachments map for these emails: only query for emails that actually have attachments
+        email_ids_with_att = [e["id"] for e in emails if e.get("has_attachments")]
         attachments_by_email = {}
-        if email_ids:
-            placeholders = ",".join(["?"] * len(email_ids))
-            att_sql = f"""
-                SELECT id, email_id, filename, file_size, mime_type, category
-                FROM attachments
-                WHERE email_id IN ({placeholders})
-            """
-            async with db.execute(att_sql, email_ids) as cur:
-                for att in await cur.fetchall():
-                    att_dict = dict(att)
-                    attachments_by_email.setdefault(att_dict["email_id"], []).append(att_dict)
+        if email_ids_with_att:
+            batch_size = 500
+            for i in range(0, len(email_ids_with_att), batch_size):
+                batch = email_ids_with_att[i:i + batch_size]
+                placeholders = ",".join(["?"] * len(batch))
+                att_sql = f"""
+                    SELECT id, email_id, filename, file_size, mime_type, category
+                    FROM attachments
+                    WHERE email_id IN ({placeholders})
+                """
+                async with db.execute(att_sql, batch) as cur:
+                    for att in await cur.fetchall():
+                        att_dict = dict(att)
+                        attachments_by_email.setdefault(att_dict["email_id"], []).append(att_dict)
 
         # Structure timeline nodes
         timeline = []
@@ -185,7 +200,7 @@ async def get_contact_timeline(
                 "to_emails": m.get("to_emails") or "",
                 "snippet": m.get("snippet") or "",
                 "body_text": m.get("body_text") or "",
-                "body_html": m.get("body_html") or "",
+                "body_html": "",
                 "date_timestamp": m.get("date_timestamp"),
                 "date_str": m.get("date_str") or "",
                 "formatted_date": m.get("formatted_date") or (m.get("date_str") or "")[:16],

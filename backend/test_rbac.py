@@ -124,6 +124,11 @@ async def run_tests():
     # User creates conversation
     conv_user = await AIService.create_conversation(title="业务员的私密对话", user_id=user_id)
 
+    async with get_db() as db:
+        await db.execute("INSERT INTO ai_messages (id, conversation_id, role, content, created_at) VALUES ('msg_adm_1', ?, 'user', '超管测试', datetime('now', 'localtime'))", (conv_admin["id"],))
+        await db.execute("INSERT INTO ai_messages (id, conversation_id, role, content, created_at) VALUES ('msg_usr_1', ?, 'user', '用户测试', datetime('now', 'localtime'))", (conv_user["id"],))
+        await db.commit()
+
     # Admin lists conversations
     admin_convs = await AIService.list_conversations(user_id="admin")
     admin_conv_ids = [c["id"] for c in admin_convs]

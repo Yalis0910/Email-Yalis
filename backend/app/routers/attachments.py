@@ -54,86 +54,150 @@ async def resolve_attachment_file(attachment_id: str) -> dict:
             att["file_path"] = str(expected_path)
             return att
 
-        # If not on disk, try on-demand fetch via IMAP
-        async with db.execute("SELECT email, access_token, provider, imap_host, imap_port, use_ssl FROM accounts WHERE id = ?", (att["account_id"],)) as cur:
+        # If not on disk, try on-demand fetch via Gmail API or IMAP
+        async with db.execute("SELECT email, access_token, provider, imap_host, imap_port, use_ssl, account_type FROM accounts WHERE id = ?", (att["account_id"],)) as cur:
             acc_row = await cur.fetchone()
 
-        if not acc_row or not acc_row["access_token"]:
-            raise HTTPException(status_code=404, detail="附件文件暂未下载且未配置对应邮箱密码")
+        if not acc_row:
+            raise HTTPException(status_code=404, detail="附件所属邮箱账户不存在")
 
-        email_addr = acc_row["email"]
-        app_pwd = acc_row["access_token"]
-        email_id = att["email_id"]
-        filename = att["filename"]
-        target_host = acc_row["imap_host"] or "imap.gmail.com"
-        target_port = int(acc_row["imap_port"] or 993)
-        use_ssl = bool(acc_row["use_ssl"] if acc_row["use_ssl"] is not None else True)
+        provider = (acc_row["provider"] or "").lower() if acc_row["provider"] else ""
+        account_type = (acc_row["account_type"] or "").lower() if acc_row["account_type"] else ""
 
-        def fetch_from_imap():
-            if use_ssl:
-                mail = imaplib.IMAP4_SSL(target_host, target_port, timeout=25)
-            else:
-                mail = imaplib.IMAP4(target_host, target_port, timeout=25)
-
-            try:
-                mail.login(email_addr, app_pwd)
-                folders_to_try = ['"[Gmail]/All Mail"', '"[Gmail]/&YkBnCZCuTvY-"', '"INBOX"']
-                found_folder = False
-                for f_name in folders_to_try:
-                    try:
-                        st, _ = mail.select(f_name, readonly=True)
-                        if st == "OK":
-                            status, data = mail.search(None, f'HEADER Message-ID "<{email_id}>"')
-                            if not data or not data[0]:
-                                status, data = mail.search(None, f'HEADER Message-ID "{email_id}"')
-                            if data and data[0]:
-                                found_folder = True
-                                break
-                    except Exception:
-                        continue
-
-                if not found_folder:
-                    try:
-                        mail.select("INBOX", readonly=True)
-                        status, data = mail.search(None, f'HEADER Message-ID "<{email_id}>"')
-                        if not data or not data[0]:
-                            status, data = mail.search(None, f'HEADER Message-ID "{email_id}"')
-                    except Exception:
-                        pass
-
-                if not data or not data[0]:
-                    return None
-
-                num = data[0].split()[-1]
-                st, msg_data = mail.fetch(num, "(RFC822)")
-                if st != "OK" or not msg_data:
-                    return None
-
-                raw_msg = email.message_from_bytes(msg_data[0][1])
-                target_fn_clean = filename.strip('"\' ').lower()
-                for part in raw_msg.walk():
-                    fn = part.get_filename()
-                    if fn:
-                        decoded_fn = decode_mime_str(fn)
-                        if (
-                            decoded_fn.strip('"\' ').lower() == target_fn_clean
-                            or fn.strip('"\' ').lower() == target_fn_clean
-                            or sanitize_filename(decoded_fn) == sanitize_filename(filename)
-                        ):
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                with open(expected_path, "wb") as f:
-                                    f.write(payload)
-                                return str(expected_path)
-                return None
-            finally:
-                try:
-                    mail.logout()
-                except Exception:
-                    pass
-
+        saved_path = None
         loop = asyncio.get_event_loop()
-        saved_path = await loop.run_in_executor(None, fetch_from_imap)
+
+        # 1. Try fetch via Gmail API if provider is gmail or account_type is gmail_oauth
+        if provider == "gmail" or account_type == "gmail_oauth":
+            try:
+                from app.services.gmail_auth import GmailAuthService
+                from googleapiclient.discovery import build
+                import base64
+
+                creds = await GmailAuthService.get_valid_credentials(att["account_id"])
+                if creds:
+                    def fetch_from_gmail():
+                        try:
+                            service = build("gmail", "v1", credentials=creds)
+                            msg = service.users().messages().get(userId="me", id=att["email_id"], format="full").execute()
+                            payload = msg.get("payload", {})
+                            target_fn = att["filename"].strip('"\' ').lower()
+
+                            def find_attachment_bytes(part):
+                                fn = part.get("filename", "")
+                                if fn and (
+                                    fn.strip('"\' ').lower() == target_fn
+                                    or sanitize_filename(fn) == safe_name
+                                    or sanitize_filename(decode_mime_str(fn)) == safe_name
+                                ):
+                                    body = part.get("body", {})
+                                    att_id = body.get("attachmentId")
+                                    if att_id:
+                                        att_res = service.users().messages().attachments().get(
+                                            userId="me", messageId=att["email_id"], id=att_id
+                                        ).execute()
+                                        data_b64 = att_res.get("data")
+                                        if data_b64:
+                                            return base64.urlsafe_b64decode(data_b64.encode("utf-8"))
+                                    elif body.get("data"):
+                                        return base64.urlsafe_b64decode(body["data"].encode("utf-8"))
+                                for subpart in part.get("parts", []):
+                                    res = find_attachment_bytes(subpart)
+                                    if res is not None:
+                                        return res
+                                return None
+
+                            content_bytes = find_attachment_bytes(payload)
+                            if content_bytes:
+                                with open(expected_path, "wb") as f:
+                                    f.write(content_bytes)
+                                return str(expected_path)
+                        except Exception as e:
+                            print(f"[Gmail Attachment Fetch Error] {e}")
+                        return None
+
+                    saved_path = await loop.run_in_executor(None, fetch_from_gmail)
+            except Exception as e:
+                print(f"[Gmail Credentials Error] {e}")
+
+        # 2. Fallback to IMAP fetch if not resolved and has access_token/password
+        if not saved_path and acc_row["access_token"]:
+            email_addr = acc_row["email"]
+            app_pwd = acc_row["access_token"]
+            email_id = att["email_id"]
+            filename = att["filename"]
+            target_host = acc_row["imap_host"] or "imap.gmail.com"
+            target_port = int(acc_row["imap_port"] or 993)
+            use_ssl = bool(acc_row["use_ssl"] if acc_row["use_ssl"] is not None else True)
+
+            def fetch_from_imap():
+                try:
+                    if use_ssl:
+                        mail = imaplib.IMAP4_SSL(target_host, target_port, timeout=25)
+                    else:
+                        mail = imaplib.IMAP4(target_host, target_port, timeout=25)
+
+                    try:
+                        mail.login(email_addr, app_pwd)
+                        folders_to_try = ['"[Gmail]/All Mail"', '"[Gmail]/&YkBnCZCuTvY-"', '"INBOX"']
+                        found_folder = False
+                        for f_name in folders_to_try:
+                            try:
+                                st, _ = mail.select(f_name, readonly=True)
+                                if st == "OK":
+                                    status, data = mail.search(None, f'HEADER Message-ID "<{email_id}>"')
+                                    if not data or not data[0]:
+                                        status, data = mail.search(None, f'HEADER Message-ID "{email_id}"')
+                                    if data and data[0]:
+                                        found_folder = True
+                                        break
+                            except Exception:
+                                continue
+
+                        if not found_folder:
+                            try:
+                                mail.select("INBOX", readonly=True)
+                                status, data = mail.search(None, f'HEADER Message-ID "<{email_id}>"')
+                                if not data or not data[0]:
+                                    status, data = mail.search(None, f'HEADER Message-ID "{email_id}"')
+                            except Exception:
+                                pass
+
+                        if not data or not data[0]:
+                            return None
+
+                        num = data[0].split()[-1]
+                        st, msg_data = mail.fetch(num, "(RFC822)")
+                        if st != "OK" or not msg_data:
+                            return None
+
+                        raw_msg = email.message_from_bytes(msg_data[0][1])
+                        target_fn_clean = filename.strip('"\' ').lower()
+                        for part in raw_msg.walk():
+                            fn = part.get_filename()
+                            if fn:
+                                decoded_fn = decode_mime_str(fn)
+                                if (
+                                    decoded_fn.strip('"\' ').lower() == target_fn_clean
+                                    or fn.strip('"\' ').lower() == target_fn_clean
+                                    or sanitize_filename(decoded_fn) == sanitize_filename(filename)
+                                ):
+                                    payload = part.get_payload(decode=True)
+                                    if payload:
+                                        with open(expected_path, "wb") as f:
+                                            f.write(payload)
+                                        return str(expected_path)
+                        return None
+                    finally:
+                        try:
+                            mail.logout()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[IMAP Attachment Fetch Error] {e}")
+                    return None
+
+            saved_path = await loop.run_in_executor(None, fetch_from_imap)
 
         if not saved_path or not os.path.exists(saved_path):
             raise HTTPException(status_code=404, detail="附件文件暂不可用或无法从邮箱服务器获取")

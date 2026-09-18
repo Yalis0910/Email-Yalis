@@ -117,13 +117,13 @@ export default function ContactTimelineDrawer({
   const [streamingReportText, setStreamingReportText] = useState('');
   const abortControllerRef = useRef(null);
 
-  // AI Copilot context integration & wide screen detection
+  // AI Copilot context integration & wide screen detection (620px timeline + 560px copilot = 1180px)
   const { openWithContactContext, isDrawerOpen: isCopilotOpen } = useAIConversation();
-  const [isWideScreen, setIsWideScreen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1200);
+  const [isWideScreen, setIsWideScreen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1180);
 
   useEffect(() => {
     const handleResize = () => {
-      setIsWideScreen(typeof window !== 'undefined' && window.innerWidth >= 1200);
+      setIsWideScreen(typeof window !== 'undefined' && window.innerWidth >= 1180);
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
@@ -478,7 +478,7 @@ export default function ContactTimelineDrawer({
     <>
       <div 
         className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-xs flex justify-end transition-all cursor-pointer overflow-x-auto ${
-          isCopilotOpen && isWideScreen ? 'pr-0 lg:pr-[480px]' : ''
+          isCopilotOpen && isWideScreen ? 'pr-[560px]' : ''
         }`}
         onClick={(e) => {
           e.stopPropagation();

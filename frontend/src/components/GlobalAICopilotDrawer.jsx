@@ -145,13 +145,7 @@ export default function GlobalAICopilotDrawer({
         </button>
       )}
 
-      {/* Drawer Overlay Backdrop */}
-      {isOpen && (
-        <div 
-          onClick={handleCloseDrawer}
-          className="fixed inset-0 bg-black/20 dark:bg-black/40 backdrop-blur-xs z-40 transition-opacity"
-        />
-      )}
+
 
       {/* Slide-out Drawer Panel */}
       {isOpen && (

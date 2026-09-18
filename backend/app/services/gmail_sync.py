@@ -49,9 +49,10 @@ async def notify_progress(account_id: str, status: str, current: int, total: int
                     sync_progress_current = ?,
                     sync_progress_total = ?,
                     sync_message = ?,
+                    total_synced = CASE WHEN ? = 'completed' THEN (SELECT COUNT(*) FROM emails WHERE account_id = ?) ELSE total_synced END,
                     last_synced_at = CASE WHEN ? = 'completed' THEN datetime('now', 'localtime') ELSE last_synced_at END
                 WHERE id = ?
-            """, (status, current, total, message, status, account_id))
+            """, (status, current, total, message, status, account_id, status, account_id))
             await db.commit()
     except Exception:
         pass
@@ -150,7 +151,12 @@ class GmailSyncService:
 
             await notify_progress(account_id, "syncing", 0, 0, "正在检索云端邮件列表...")
 
-            # List all messages
+            # Query existing message IDs from SQLite first for fast incremental detection
+            async with get_db() as db:
+                async with db.execute("SELECT id FROM emails WHERE account_id = ?", (account_id,)) as cur:
+                    existing_ids = {row[0] async for row in cur}
+
+            # List all messages from cloud
             all_messages = []
             page_token = None
             query_filter = ""  # fetch all
@@ -176,28 +182,23 @@ class GmailSyncService:
                     all_messages = all_messages[:max_results]
                     break
 
-            total_messages = len(all_messages)
-            if total_messages == 0:
+            if len(all_messages) == 0 and not existing_ids:
                 await notify_progress(account_id, "completed", 0, 0, "邮箱内无邮件记录")
                 return
-
-            # Query existing message IDs from SQLite
-            async with get_db() as db:
-                async with db.execute("SELECT id FROM emails WHERE account_id = ?", (account_id,)) as cur:
-                    existing_ids = {row[0] async for row in cur}
 
             if not full_sync and existing_ids:
                 new_messages = [msg for msg in all_messages if msg["id"] not in existing_ids]
             else:
                 new_messages = all_messages
 
+            total_count_display = len(existing_ids) if (not full_sync and existing_ids) else len(all_messages)
             if len(new_messages) == 0:
                 await notify_progress(
                     account_id,
                     "completed",
-                    total_messages,
-                    total_messages,
-                    f"增量同步完成：全部 {total_messages} 封邮件均已就绪（无新增信件）。"
+                    total_count_display,
+                    total_count_display,
+                    f"增量同步完成：全部 {total_count_display} 封邮件均已就绪（无新增信件）。"
                 )
                 async with get_db() as db:
                     await db.execute("""
@@ -214,35 +215,63 @@ class GmailSyncService:
 
             await notify_progress(account_id, "syncing", 0, len(new_messages), f"共发现 {len(new_messages)} 封新增邮件，开始批量高速拉取与解析...")
 
-            # Batch fetch messages in chunks of 50
-            chunk_size = 50
+            # Batch fetch messages in safe chunks of 20 with rate-limiting & backoff
+            chunk_size = 20
             processed_count = 0
 
             for i in range(0, len(new_messages), chunk_size):
                 chunk = new_messages[i:i + chunk_size]
-                fetched_details = []
+                remaining_in_chunk = list(chunk)
+                max_retries = 5
+                backoff_delay = 2.0
 
-                # Use batch request
-                batch = service.new_batch_http_request()
+                while remaining_in_chunk and max_retries > 0:
+                    fetched_details = []
+                    is_rate_limited = False
 
-                def callback(request_id, response, exception):
-                    if exception is None and response:
-                        fetched_details.append(response)
+                    batch = service.new_batch_http_request()
 
-                for msg in chunk:
-                    batch.add(
-                        service.users().messages().get(userId="me", id=msg["id"], format="full"),
-                        callback=callback
-                    )
+                    def callback(request_id, response, exception):
+                        nonlocal is_rate_limited
+                        if exception is None and response:
+                            fetched_details.append(response)
+                        else:
+                            err_str = str(exception)
+                            if any(k in err_str for k in ("429", "403", "rateLimitExceeded", "concurrent requests")):
+                                is_rate_limited = True
 
-                # Execute batch request in thread pool to avoid blocking asyncio loop
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, batch.execute)
+                    for msg in remaining_in_chunk:
+                        batch.add(
+                            service.users().messages().get(userId="me", id=msg["id"], format="full"),
+                            callback=callback
+                        )
 
-                # Process and save the fetched batch
-                await cls._save_batch_messages(account_id, fetched_details)
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, batch.execute)
 
-                processed_count += len(chunk)
+                    if fetched_details:
+                        await cls._save_batch_messages(account_id, fetched_details)
+                        saved_ids = {m.get("id") for m in fetched_details}
+                        remaining_in_chunk = [m for m in remaining_in_chunk if m["id"] not in saved_ids]
+
+                    if remaining_in_chunk:
+                        if is_rate_limited:
+                            await notify_progress(
+                                account_id,
+                                "syncing",
+                                processed_count,
+                                len(new_messages),
+                                f"触发云端流控，安全等待 {int(backoff_delay)} 秒后自动重试... ({processed_count}/{len(new_messages)})"
+                            )
+                            await asyncio.sleep(backoff_delay)
+                            backoff_delay = min(backoff_delay * 2, 30.0)
+                        else:
+                            await asyncio.sleep(1.0)
+                        max_retries -= 1
+                    else:
+                        await asyncio.sleep(0.3)
+
+                processed_count += (len(chunk) - len(remaining_in_chunk))
                 await notify_progress(
                     account_id,
                     "syncing",
@@ -259,11 +288,23 @@ class GmailSyncService:
                         total_synced = (SELECT COUNT(*) FROM emails WHERE account_id = ?)
                     WHERE id = ?
                 """, (latest_history_id, account_id, account_id))
+                await db.commit()
             # Rebuild contacts accurately from emails
             from app.services.stats_service import StatsService
             await StatsService.rebuild_contacts(account_id)
 
-            await notify_progress(account_id, "completed", total_messages, total_messages, f"全量同步完成，已成功入库与深度挖掘 {total_messages} 封邮件！")
+            # Query actual final count in DB
+            async with get_db() as db:
+                async with db.execute("SELECT COUNT(*) FROM emails WHERE account_id = ?", (account_id,)) as cur:
+                    final_count = (await cur.fetchone())[0]
+
+            await notify_progress(
+                account_id,
+                "completed",
+                final_count,
+                final_count,
+                f"同步完成，已成功入库与深度挖掘 {final_count} 封邮件！"
+            )
 
         except Exception as e:
             await notify_progress(account_id, "error", 0, 0, f"同步发生异常: {str(e)}")

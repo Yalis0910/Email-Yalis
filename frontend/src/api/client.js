@@ -108,6 +108,7 @@ export const api = {
   // ================= Accounts & IMAP =================
   getAccounts: () => request('/api/auth/accounts'),
   deleteAccount: (id) => request(`/api/auth/accounts/${id}`, { method: 'DELETE' }),
+  clearAccountEmails: (id) => request(`/api/auth/accounts/${id}/clear_emails`, { method: 'POST' }),
   connectImap: (emailOrData, appPassword) => {
     let payload = {};
     if (typeof emailOrData === 'object') {
@@ -121,6 +122,43 @@ export const api = {
     });
   },
   seedDemoData: () => request('/api/auth/seed_demo', { method: 'POST' }),
+
+  // ================= Google OAuth 2.0 =================
+  getGoogleAuthStatus: () => request('/api/auth/google/status'),
+  uploadGoogleCredentials: async (fileOrJson) => {
+    if (typeof File !== 'undefined' && fileOrJson instanceof File) {
+      const formData = new FormData();
+      formData.append('file', fileOrJson);
+      const url = `${getBaseUrl()}/api/auth/google/credentials`;
+      const token = typeof localStorage !== 'undefined' ? localStorage.getItem('email_yalis_token') : null;
+      const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: formData
+      });
+      if (!res.ok) {
+        let errorMsg = '上传凭据失败';
+        try {
+          const err = await res.json();
+          errorMsg = err.detail || errorMsg;
+        } catch (_) {}
+        throw new Error(errorMsg);
+      }
+      return res.json();
+    } else {
+      return request('/api/auth/google/credentials', {
+        method: 'POST',
+        body: JSON.stringify(fileOrJson)
+      });
+    }
+  },
+  deleteGoogleCredentials: () => request('/api/auth/google/credentials', { method: 'DELETE' }),
+  getGoogleAuthUrl: (frontendOrigin) => {
+    const origin = frontendOrigin || (typeof window !== 'undefined' ? window.location.origin : '');
+    const param = origin ? `?frontend_origin=${encodeURIComponent(origin)}` : '';
+    return request(`/api/auth/google/url${param}`);
+  },
 
   // ================= Sync API =================
   triggerSync: (accountId, fullSync = false, maxResults = null, force = false) => request('/api/sync/trigger', {

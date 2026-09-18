@@ -41,7 +41,8 @@ class GmailAuthService:
         flow = Flow.from_client_secrets_file(
             str(CREDENTIALS_FILE),
             scopes=GMAIL_SCOPES,
-            redirect_uri=redirect_uri or OAUTH_REDIRECT_URI
+            redirect_uri=redirect_uri or OAUTH_REDIRECT_URI,
+            autogenerate_code_verifier=False
         )
         return flow
 
@@ -56,7 +57,12 @@ class GmailAuthService:
         return {"auth_url": auth_url, "state": state}
 
     @classmethod
-    async def exchange_code_and_save_account(cls, code: str, redirect_uri: Optional[str] = None) -> Dict[str, Any]:
+    async def exchange_code_and_save_account(
+        cls,
+        code: str,
+        redirect_uri: Optional[str] = None,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         flow = cls.create_oauth_flow(redirect_uri)
         flow.fetch_token(code=code)
         creds = flow.credentials
@@ -78,24 +84,28 @@ class GmailAuthService:
         except Exception:
             pass
 
-        account_id = f"acc_{email_address}"
+        account_id = f"acc_{email_address.lower()}"
 
         async with get_db() as db:
             await db.execute("""
                 INSERT INTO accounts (
                     id, email, display_name, avatar_url, access_token, refresh_token,
-                    token_expiry, history_id, sync_status, sync_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', '已成功连接')
+                    token_expiry, history_id, sync_status, sync_message, account_type, provider
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'idle', 'Google 官方授权已连接', 'gmail', 'gmail')
                 ON CONFLICT(email) DO UPDATE SET
                     display_name = excluded.display_name,
                     avatar_url = excluded.avatar_url,
                     access_token = excluded.access_token,
                     refresh_token = COALESCE(excluded.refresh_token, accounts.refresh_token),
                     token_expiry = excluded.token_expiry,
-                    history_id = excluded.history_id
+                    history_id = excluded.history_id,
+                    account_type = 'gmail',
+                    provider = 'gmail',
+                    sync_status = 'idle',
+                    sync_message = 'Google 官方授权已连接'
             """, (
                 account_id,
-                email_address,
+                email_address.lower(),
                 display_name,
                 avatar_url,
                 creds.token,
@@ -105,9 +115,21 @@ class GmailAuthService:
             ))
             await db.commit()
 
+        # Grant access to user if user_id is provided
+        if user_id:
+            try:
+                async with get_db() as db:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO user_account_permissions (user_id, account_id) VALUES (?, ?)",
+                        (user_id, account_id)
+                    )
+                    await db.commit()
+            except Exception:
+                pass
+
         return {
             "id": account_id,
-            "email": email_address,
+            "email": email_address.lower(),
             "display_name": display_name,
             "avatar_url": avatar_url
         }

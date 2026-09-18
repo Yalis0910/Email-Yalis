@@ -1,13 +1,218 @@
-from fastapi import APIRouter, HTTPException, Depends
+import json
+import base64
+from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File
+from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List
 
+from app.config import CREDENTIALS_FILE, DATA_DIR, OAUTH_REDIRECT_URI
 from app.database import get_db
 from app.schemas import AccountOut
 from app.services.imap_sync import GenericImapService, PROVIDER_DEFAULTS
+from app.services.gmail_auth import GmailAuthService
 from app.services.demo_data import seed_demo_data
 from app.dependencies import get_current_user, require_permission, get_authorized_account_ids
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+@router.get("/google/status")
+async def get_google_oauth_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    info = GmailAuthService.get_credentials_info()
+    return {
+        "configured": bool(info and info.get("configured")),
+        "client_id": info.get("client_id") if info else None,
+        "project_id": info.get("project_id") if info else None,
+        "client_type": info.get("client_type") if info else None,
+        "redirect_uri": OAUTH_REDIRECT_URI
+    }
+
+@router.post("/google/credentials")
+async def upload_google_credentials(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_permission("action:accounts_manage"))
+):
+    content_dict = None
+    content_type = request.headers.get("content-type", "").lower()
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file_obj = form.get("file")
+        if file_obj and hasattr(file_obj, "read"):
+            try:
+                raw_bytes = await file_obj.read()
+                content_dict = json.loads(raw_bytes.decode("utf-8"))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"无法解析上传的 JSON 文件: {str(e)}")
+    else:
+        try:
+            content_dict = await request.json()
+        except Exception:
+            pass
+
+    if not content_dict or not isinstance(content_dict, dict):
+        raise HTTPException(status_code=400, detail="请上传有效的 Google 客户端凭据 JSON 文件或提交配置内容")
+
+    # Validate client_secrets structure
+    client_type = "web" if "web" in content_dict else ("installed" if "installed" in content_dict else None)
+    if not client_type:
+        raise HTTPException(
+            status_code=400,
+            detail="无效的 Google 客户端凭据文件：未找到 'web' 或 'installed' 配置节点，请确认是从 Google Cloud 凭据页面下载的客户端密钥 JSON 文件。"
+        )
+
+    info = content_dict[client_type]
+    if not info.get("client_id") or not info.get("client_secret"):
+        raise HTTPException(
+            status_code=400,
+            detail="凭据文件中缺少 client_id 或 client_secret，请检查文件是否完整。"
+        )
+
+    # Save to CREDENTIALS_FILE
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+        json.dump(content_dict, f, indent=2, ensure_ascii=False)
+
+    return {
+        "status": "success",
+        "message": "Google OAuth 客户端凭据已成功导入并就绪！",
+        "info": {
+            "client_id": info.get("client_id"),
+            "project_id": info.get("project_id"),
+            "client_type": client_type,
+            "configured": True
+        }
+    }
+
+@router.delete("/google/credentials")
+async def delete_google_credentials(
+    current_user: Dict[str, Any] = Depends(require_permission("action:accounts_manage"))
+):
+    if CREDENTIALS_FILE.exists():
+        try:
+            CREDENTIALS_FILE.unlink()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"删除凭据文件失败: {str(e)}")
+    return {"status": "success", "message": "已清除 Google OAuth 凭据配置"}
+
+@router.get("/google/url")
+async def get_google_auth_url(
+    frontend_origin: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(require_permission("action:accounts_manage"))
+):
+    if not GmailAuthService.is_credentials_configured():
+        raise HTTPException(status_code=400, detail="系统尚未配置 Google OAuth 客户端凭据 (credentials.json)，请先上传凭据文件")
+
+    # Encode user_id and origin into state so callback can route and authorize
+    state_payload = {
+        "user_id": current_user["id"],
+        "origin": frontend_origin or "http://localhost:5173"
+    }
+    state_str = base64.urlsafe_b64encode(json.dumps(state_payload).encode()).decode()
+
+    try:
+        flow = GmailAuthService.create_oauth_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent',
+            state=state_str
+        )
+        return {"auth_url": auth_url, "state": state_str}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成 Google 授权链接失败: {str(e)}")
+
+@router.get("/callback")
+async def google_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None
+):
+    # Decode state if possible
+    user_id = None
+    frontend_origin = "http://localhost:5173"
+    if state:
+        try:
+            state_data = json.loads(base64.urlsafe_b64decode(state.encode()).decode())
+            user_id = state_data.get("user_id")
+            frontend_origin = state_data.get("origin") or frontend_origin
+        except Exception:
+            pass
+
+    if error:
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>Google 授权失败</title>
+        <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0c0d0e; color: #fff; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #18191b; border: 1px solid #ff4d4f; border-radius: 12px; padding: 32px; max-width: 480px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+        h2 {{ color: #ff4d4f; margin-top: 0; }} p {{ color: #a1a1aa; font-size: 14px; line-height: 1.6; word-break: break-all; }}
+        button {{ margin-top: 16px; padding: 8px 20px; border-radius: 6px; border: none; background: #27272a; color: #fff; cursor: pointer; }}
+        </style></head>
+        <body>
+        <div class="card">
+            <h2>授权未完成</h2>
+            <p>Google 返回授权提示: <code>{error}</code></p>
+            <button onclick="window.close()">关闭此窗口</button>
+        </div>
+        </body></html>
+        """
+        return HTMLResponse(content=html, status_code=400)
+
+    if not code:
+        raise HTTPException(status_code=400, detail="缺少授权 Code")
+
+    try:
+        acc = await GmailAuthService.exchange_code_and_save_account(code, user_id=user_id)
+        email = acc.get("email", "")
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>Google 授权成功</title>
+        <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0c0d0e; color: #fff; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #18191b; border: 1px solid #10b981; border-radius: 12px; padding: 32px; max-width: 480px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+        h2 {{ color: #10b981; margin-top: 0; }} p {{ color: #a1a1aa; font-size: 14px; line-height: 1.6; }}
+        .email {{ font-weight: bold; color: #fff; background: #27272a; padding: 6px 14px; border-radius: 6px; display: inline-block; margin: 10px 0; font-family: monospace; }}
+        </style></head>
+        <body>
+        <div class="card">
+            <h2>✅ Google 官方授权接入成功！</h2>
+            <p>已成功通过 Google REST API 接入邮箱：</p>
+            <div class="email">{email}</div>
+            <p>正在同步账户状态，窗口即将自动关闭并刷新页面...</p>
+        </div>
+        <script>
+        const payload = {{ type: 'GOOGLE_OAUTH_SUCCESS', account: {json.dumps(acc)}, email: '{email}' }};
+        if (window.opener) {{
+            window.opener.postMessage(payload, '*');
+            setTimeout(() => {{ window.close(); }}, 1200);
+        }} else {{
+            setTimeout(() => {{ window.location.href = '{frontend_origin}/#settings'; }}, 1500);
+        }}
+        </script>
+        </body></html>
+        """
+        return HTMLResponse(content=html)
+    except Exception as e:
+        err_str = str(e)
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>授权交换失败</title>
+        <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0c0d0e; color: #fff; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #18191b; border: 1px solid #ff4d4f; border-radius: 12px; padding: 32px; max-width: 480px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+        h2 {{ color: #ff4d4f; margin-top: 0; }} p {{ color: #a1a1aa; font-size: 14px; line-height: 1.6; word-break: break-all; }}
+        button {{ margin-top: 16px; padding: 8px 20px; border-radius: 6px; border: none; background: #27272a; color: #fff; cursor: pointer; }}
+        </style></head>
+        <body>
+        <div class="card">
+            <h2>授权凭据交换异常</h2>
+            <p>{err_str}</p>
+            <button onclick="window.close()">关闭此窗口</button>
+        </div>
+        </body></html>
+        """
+        return HTMLResponse(content=html, status_code=500)
 
 @router.post("/connect_imap")
 async def connect_imap(
@@ -83,6 +288,73 @@ async def list_accounts(current_user: Dict[str, Any] = Depends(get_current_user)
             ) as c:
                 rows = await c.fetchall()
                 return [dict(r) for r in rows]
+
+@router.post("/accounts/{account_id}/clear_emails")
+async def clear_account_emails(
+    account_id: str,
+    current_user: Dict[str, Any] = Depends(require_permission("action:accounts_manage"))
+):
+    import shutil
+    from app.config import ATTACHMENTS_DIR
+    from app.services.gmail_sync import SYNC_PROGRESS
+
+    SYNC_PROGRESS.pop(account_id, None)
+
+    async with get_db() as db:
+        # Check account existence
+        async with db.execute("SELECT id, email FROM accounts WHERE id = ?", (account_id,)) as cur:
+            acc_row = await cur.fetchone()
+            if not acc_row:
+                raise HTTPException(status_code=404, detail="未找到该邮箱账号")
+            acc_email = acc_row["email"]
+
+        # Count emails for clear user feedback
+        async with db.execute("SELECT COUNT(*) FROM emails WHERE account_id = ?", (account_id,)) as cur:
+            email_count = (await cur.fetchone())[0]
+
+        # Fast explicit cleanup of email data while PRESERVING account and permissions
+        await db.execute("DELETE FROM digital_assets WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM subscriptions WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM contact_ai_reports WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM contacts WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM email_ai_insights WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM attachments WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM emails WHERE account_id = ?", (account_id,))
+
+        # Reset account statistics and progress
+        await db.execute("""
+            UPDATE accounts SET
+                total_synced = 0,
+                sync_progress_current = 0,
+                sync_progress_total = 0,
+                sync_status = 'idle',
+                sync_message = '邮件与资产已清空，等待重新同步',
+                history_id = NULL
+            WHERE id = ?
+        """, (account_id,))
+        await db.commit()
+
+    # Clean local attachment files if present
+    try:
+        acc_att_dir = ATTACHMENTS_DIR / account_id
+        if acc_att_dir.exists():
+            shutil.rmtree(acc_att_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Rebuild contact cache asynchronously in background
+    try:
+        from app.services.stats_service import StatsService
+        await StatsService.rebuild_contacts()
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "message": f"账号 {acc_email} 的 {email_count} 封邮件与本地资产缓存已成功清空！账号配置已保留。",
+        "cleared_emails": email_count,
+        "account_id": account_id
+    }
 
 @router.delete("/accounts/{account_id}")
 async def delete_account(

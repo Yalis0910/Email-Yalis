@@ -12,7 +12,10 @@ import {
   Loader2,
   Table,
   FileCode2,
-  Mail
+  Mail,
+  CloudDownload,
+  AlertCircle,
+  RotateCw
 } from 'lucide-react';
 import { api } from '../api/client';
 
@@ -21,6 +24,10 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
   const [loadingContent, setLoadingContent] = useState(false);
   const [contentError, setContentError] = useState(null);
   const [viewFormat, setViewFormat] = useState('table'); // 'table' | 'raw'
+  const [imageLoading, setImageLoading] = useState(true);
+  const [imageError, setImageError] = useState(false);
+  const [pdfLoading, setPdfLoading] = useState(true);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   // ESC key listener to close attachment preview
   useEffect(() => {
@@ -41,6 +48,10 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
       return;
     }
 
+    setImageLoading(true);
+    setImageError(false);
+    setPdfLoading(true);
+
     const filename = attachment.filename || '';
     const ext = filename.split('.').pop().toLowerCase();
     const isTextual = ['csv', 'txt', 'json', 'log', 'md', 'xml', 'js', 'py', 'html'].includes(ext) ||
@@ -49,7 +60,7 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
     if (isTextual) {
       fetchTextContent(attachment.id);
     }
-  }, [isOpen, attachment?.id]);
+  }, [isOpen, attachment?.id, retryNonce]);
 
   if (!isOpen || !attachment) return null;
 
@@ -76,7 +87,10 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
 
   const filename = attachment.filename || '未知文件';
   const ext = filename.split('.').pop().toLowerCase();
-  const previewUrl = api.getAttachmentPreviewUrl(attachment.id);
+  const rawPreviewUrl = api.getAttachmentPreviewUrl(attachment.id);
+  const previewUrl = retryNonce > 0 
+    ? `${rawPreviewUrl}${rawPreviewUrl.includes('?') ? '&' : '?'}_r=${retryNonce}` 
+    : rawPreviewUrl;
   const downloadUrl = api.getAttachmentDownloadUrl(attachment.id);
 
   const isPdf = ext === 'pdf' || attachment.mime_type === 'application/pdf';
@@ -241,13 +255,28 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
         </div>
 
         {/* Modal Body */}
-        <div className="flex-1 min-h-[420px] max-h-[76vh] overflow-auto bg-[var(--color-surface)] flex flex-col justify-center">
+        <div className="flex-1 min-h-[440px] max-h-[76vh] overflow-auto bg-[var(--color-surface)] flex flex-col justify-center relative">
           {/* PDF Viewer */}
           {isPdf && (
-            <div className="w-full h-[76vh] flex flex-col">
+            <div className="relative w-full h-[76vh] flex flex-col bg-[var(--color-surface-subtle)]/30">
+              {pdfLoading && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-8 bg-[var(--color-surface)]/90 backdrop-blur-xs z-20">
+                  <div className="w-12 h-12 rounded-2xl bg-[var(--color-accent)]/10 border border-[var(--color-accent)]/20 flex items-center justify-center text-[var(--color-accent)] mb-3 shadow-xs">
+                    <Loader2 className="w-6 h-6 animate-spin text-[var(--color-accent)]" />
+                  </div>
+                  <h4 className="text-sm font-medium text-[var(--color-neutral-10)]">
+                    {!attachment.storage_path ? '正在从云端拉取 PDF 文档...' : '正在载入 PDF 文档...'}
+                  </h4>
+                  <p className="text-xs font-mono text-[var(--color-neutral-6)] mt-1.5 tabular-nums">
+                    {formatBytes(attachment.file_size)} • PDF 文档
+                    {!attachment.storage_path && ' • 首次预览需自云端同步'}
+                  </p>
+                </div>
+              )}
               <iframe
                 src={previewUrl}
                 title={filename}
+                onLoad={() => setPdfLoading(false)}
                 className="w-full flex-1 border-0 bg-white"
               />
             </div>
@@ -255,11 +284,83 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
 
           {/* Image Viewer */}
           {isImage && (
-            <div className="p-6 flex items-center justify-center min-h-[420px] bg-[var(--color-surface-subtle)]/50">
+            <div className="relative p-6 flex flex-col items-center justify-center min-h-[440px] max-h-[76vh] bg-[var(--color-surface-subtle)]/40 overflow-hidden select-none">
+              {/* Image Loading State */}
+              {imageLoading && !imageError && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-8 bg-[var(--color-surface)]/85 backdrop-blur-xs z-20 animate-in fade-in duration-200">
+                  <div className="relative flex items-center justify-center mb-4">
+                    <div className="w-14 h-14 rounded-2xl bg-[var(--color-accent)]/10 border border-[var(--color-accent)]/20 flex items-center justify-center text-[var(--color-accent)] shadow-sm">
+                      <CloudDownload className="w-7 h-7 animate-pulse text-[var(--color-accent)]" />
+                    </div>
+                    <div className="absolute -inset-1.5 rounded-2xl border border-[var(--color-accent)]/30 animate-ping opacity-20 pointer-events-none" />
+                  </div>
+
+                  <h4 className="text-sm font-medium text-[var(--color-neutral-10)] flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-[var(--color-accent)]" />
+                    <span>{!attachment.storage_path ? '正在从云端邮箱拉取附件并加载...' : '正在载入高清图片...'}</span>
+                  </h4>
+
+                  <p className="text-xs font-mono text-[var(--color-neutral-6)] mt-2 tabular-nums">
+                    {formatBytes(attachment.file_size)} • {ext.toUpperCase()}
+                    {!attachment.storage_path && ' • 首次预览需自 Gmail 传输'}
+                  </p>
+
+                  <div className="mt-4 max-w-sm text-center px-3.5 py-2 rounded-lg bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[11px] font-mono text-[var(--color-neutral-6)] leading-relaxed shadow-2xs">
+                    💡 大图首次加载需自远端邮箱实时同步，下载后将自动持久化至本地硬盘，后续查看立即可见。
+                  </div>
+                </div>
+              )}
+
+              {/* Image Error State */}
+              {imageError && (
+                <div className="py-16 text-center px-4 z-20">
+                  <div className="w-12 h-12 rounded-xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-600 mx-auto mb-3">
+                    <AlertCircle className="w-6 h-6" />
+                  </div>
+                  <h4 className="text-sm font-medium text-[var(--color-neutral-10)]">图片预览加载失败</h4>
+                  <p className="text-xs font-mono text-[var(--color-neutral-6)] mt-1.5 max-w-md mx-auto leading-relaxed">
+                    可能由于云端网络波动或连接超时。您可以尝试重新加载，或直接下载原图。
+                  </p>
+                  <div className="mt-5 flex items-center justify-center gap-3">
+                    <button
+                      onClick={() => {
+                        setImageLoading(true);
+                        setImageError(false);
+                        setRetryNonce(prev => prev + 1);
+                      }}
+                      className="yohaku-btn-secondary px-3.5 py-1.5 text-xs font-mono flex items-center gap-1.5"
+                    >
+                      <RotateCw className="w-3.5 h-3.5" />
+                      <span>重试加载</span>
+                    </button>
+                    <a
+                      href={downloadUrl}
+                      download={filename}
+                      className="yohaku-btn-primary px-3.5 py-1.5 text-xs font-mono flex items-center gap-1.5"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>直接下载原图</span>
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* The Actual Image */}
               <img
+                key={`${attachment.id}-${retryNonce}`}
                 src={previewUrl}
                 alt={filename}
-                className="max-h-[70vh] max-w-full object-contain rounded-md shadow-sm border border-[var(--color-border)]"
+                onLoad={() => {
+                  setImageLoading(false);
+                  setImageError(false);
+                }}
+                onError={() => {
+                  setImageLoading(false);
+                  setImageError(true);
+                }}
+                className={`max-h-[70vh] max-w-full object-contain rounded-md shadow-sm border border-[var(--color-border)] transition-opacity duration-300 ${
+                  imageLoading || imageError ? 'opacity-0 h-0 w-0 pointer-events-none' : 'opacity-100'
+                }`}
               />
             </div>
           )}
@@ -357,8 +458,26 @@ export default function AttachmentPreviewModal({ attachment, isOpen, onClose, on
         {/* Modal Footer Tip */}
         <div className="px-5 py-2.5 border-t border-[var(--color-border)] bg-[var(--color-surface-subtle)]/40 flex items-center justify-between text-[11px] font-mono text-[var(--color-neutral-6)] flex-shrink-0">
           <div className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-            <span>本地存储安全就绪</span>
+            {(imageLoading && isImage) || (pdfLoading && isPdf) || loadingContent ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                <span className="text-amber-600 dark:text-amber-400 font-medium">
+                  {!attachment.storage_path ? '正在自远端 Gmail 服务器安全拉取...' : '正在加载中...'}
+                </span>
+              </>
+            ) : imageError || contentError ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-rose-500" />
+                <span className="text-rose-600">云端传输异常</span>
+              </>
+            ) : (
+              <>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  本地存储就绪
+                </span>
+              </>
+            )}
           </div>
           <div className="text-[10px] text-[var(--color-neutral-5)]">
             余白极简资产系统 • 本地私密托管

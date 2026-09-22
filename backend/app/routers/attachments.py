@@ -323,13 +323,23 @@ async def get_attachment_detail(
     check_account_access(att["account_id"], current_user)
     return att
 
+async def check_attachment_permission(attachment_id: str, current_user: Dict[str, Any]) -> str:
+    async with get_db() as db:
+        async with db.execute("SELECT account_id FROM attachments WHERE id = ?", (attachment_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="未找到该附件记录")
+            account_id = row["account_id"]
+    check_account_access(account_id, current_user)
+    return account_id
+
 @router.get("/{attachment_id}/preview")
 async def preview_attachment(
     attachment_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    await check_attachment_permission(attachment_id, current_user)
     att = await resolve_attachment_file(attachment_id)
-    check_account_access(att["account_id"], current_user)
     file_path = att["file_path"]
     filename = att["filename"]
     ext = os.path.splitext(filename)[1].lower()
@@ -358,8 +368,8 @@ async def download_attachment(
     attachment_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    await check_attachment_permission(attachment_id, current_user)
     att = await resolve_attachment_file(attachment_id)
-    check_account_access(att["account_id"], current_user)
     file_path = att["file_path"]
     filename = att["filename"]
 
@@ -375,16 +385,30 @@ async def get_attachment_content(
     attachment_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    await check_attachment_permission(attachment_id, current_user)
     att = await resolve_attachment_file(attachment_id)
-    check_account_access(att["account_id"], current_user)
     file_path = Path(att["file_path"])
 
     try:
-        raw = file_path.read_bytes()
+        # Prevent OOM for huge files (> 5MB)
+        MAX_TEXT_PARSE_SIZE = 5 * 1024 * 1024
+        file_size = file_path.stat().st_size
+        if file_size > MAX_TEXT_PARSE_SIZE:
+            with open(file_path, "rb") as f:
+                raw = f.read(MAX_TEXT_PARSE_SIZE)
+            is_truncated = True
+        else:
+            raw = file_path.read_bytes()
+            is_truncated = False
+
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             text = raw.decode("gbk", errors="replace")
+
+        if is_truncated:
+            text += "\n\n...[文件过大，已自动截断前 5MB 文本保护页面响应]..."
+
         return {
             "id": att["id"],
             "filename": att["filename"],

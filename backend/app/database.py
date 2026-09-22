@@ -52,6 +52,12 @@ CREATE INDEX IF NOT EXISTS idx_emails_account_date ON emails(account_id, date_ti
 CREATE INDEX IF NOT EXISTS idx_emails_from ON emails(from_email);
 CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_acc_from_nocase ON emails(account_id, from_email COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_emails_acc_att_date ON emails(account_id, has_attachments, date_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_emails_thread_date ON emails(thread_id, date_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_attachments_acc_created ON attachments(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_assets_acc_activity ON digital_assets(account_id, last_activity_at DESC);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_acc_date ON subscriptions(account_id, invoice_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_messages_conv_created ON ai_messages(conversation_id, created_at ASC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS email_fts USING fts5(
     id UNINDEXED,
@@ -294,6 +300,9 @@ def init_db():
     try:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 30000;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA cache_size = -64000;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
         conn.executescript(SCHEMA_SQL)
 
         # Migration: Ensure accounts table has generic IMAP columns
@@ -336,8 +345,14 @@ def init_db():
         if "compressed_at" not in conv_cols:
             conn.execute("ALTER TABLE ai_conversations ADD COLUMN compressed_at TEXT")
 
-        # Migration: Ensure fast contact email lookup index
+        # Migration: Ensure fast contact email lookup index & high-performance composite indexes
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_acc_from_nocase ON emails(account_id, from_email COLLATE NOCASE);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_acc_att_date ON emails(account_id, has_attachments, date_timestamp DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_thread_date ON emails(thread_id, date_timestamp DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_acc_created ON attachments(account_id, created_at DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_acc_activity ON digital_assets(account_id, last_activity_at DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_acc_date ON subscriptions(account_id, invoice_date DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_messages_conv_created ON ai_messages(conversation_id, created_at ASC);")
 
         # Migration: Ensure contacts table has CRM & tiering columns
         cur_ct = conn.execute("PRAGMA table_info(contacts)")
@@ -486,4 +501,7 @@ async def get_db():
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA foreign_keys = ON;")
         await db.execute("PRAGMA busy_timeout = 30000;")
+        await db.execute("PRAGMA synchronous = NORMAL;")
+        await db.execute("PRAGMA cache_size = -64000;")
+        await db.execute("PRAGMA temp_store = MEMORY;")
         yield db

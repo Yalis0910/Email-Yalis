@@ -156,13 +156,13 @@ class SalesService:
         # Step 2: Fetch email history (up to 25 emails)
         async with get_db() as db:
             e_cur = await db.execute("""
-                SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text, has_attachments
+                SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text, has_attachments, date_timestamp
                 FROM emails
                 WHERE (lower(from_email) = lower(?) OR to_emails LIKE ? OR cc_emails LIKE ?)
                 ORDER BY date_timestamp DESC
                 LIMIT 25
             """, (c_email, f"%{c_email}%", f"%{c_email}%"))
-            emails = await e_cur.fetchall()
+            emails = [dict(r) for r in await e_cur.fetchall()]
 
             # Query attachments for these emails to find invoices, quotes, POs, specs
             email_ids = [em["id"] for em in emails]
@@ -174,9 +174,9 @@ class SalesService:
                     FROM attachments 
                     WHERE email_id IN ({placeholders})
                 """, email_ids)
-                att_rows = await a_cur.fetchall()
+                att_rows = [dict(r) for r in await a_cur.fetchall()]
                 for a in att_rows:
-                    att_info_list.append(f"{a['filename']} ({a['category'] or 'file'})")
+                    att_info_list.append(f"{a['filename']} ({a.get('category') or 'file'})")
 
         if not emails:
             tier = "D"
@@ -200,7 +200,59 @@ class SalesService:
                 "estimated_value": est_val
             }
 
-        # Format digest of recent emails
+        # Calculate recency & current time anchor
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+
+        days_silent = None
+        last_date_display = "未知"
+        if emails:
+            last_em = emails[0]
+            last_date_display = last_em.get("date_str") or "未知"
+            ts = last_em.get("date_timestamp")
+            if ts:
+                try:
+                    ts_val = float(ts)
+                    if ts_val > 1e11:
+                        ts_val = ts_val / 1000.0
+                    last_dt = datetime.fromtimestamp(ts_val)
+                    days_silent = max(0, (now - last_dt).days)
+                except Exception:
+                    pass
+
+        if days_silent is None and contact_dict.get("last_interaction"):
+            last_date_display = contact_dict["last_interaction"]
+            try:
+                clean_d = last_date_display[:19].replace("T", " ")
+                last_dt = datetime.strptime(clean_d, "%Y-%m-%d %H:%M:%S")
+                days_silent = max(0, (now - last_dt).days)
+            except Exception:
+                try:
+                    clean_d = last_date_display[:10]
+                    last_dt = datetime.strptime(clean_d, "%Y-%m-%d")
+                    days_silent = max(0, (now - last_dt).days)
+                except Exception:
+                    pass
+
+        if days_silent is None:
+            recency_desc = "往来时间未知"
+        elif days_silent == 0:
+            recency_desc = "今日/24小时内最新互动（高时效）"
+        elif days_silent == 1:
+            recency_desc = "昨天互动（1天前）"
+        else:
+            recency_desc = f"距今已 {days_silent} 天"
+
+        latest_sender_desc = "暂无往来记录"
+        if emails:
+            last_em = emails[0]
+            from_em = (last_em.get("from_email") or "").strip().lower()
+            if from_em == c_email:
+                latest_sender_desc = f"客户最后来信（已等待我方跟进处理: {recency_desc}）"
+            else:
+                latest_sender_desc = f"我方最后发出（正等待客户回复: {recency_desc}）"
+
+        # Format digest of recent emails with sender direction tags
         email_snippets = []
         has_commercial_signals = False
         for em in emails[:15]:
@@ -209,28 +261,43 @@ class SalesService:
             txt_lower = (subj + " " + snip).lower()
             if any(kw in txt_lower for kw in COMMERCIAL_KEYWORDS):
                 has_commercial_signals = True
-            email_snippets.append(f"- [{em['date_str']}] 主题: 《{subj}》 | 内容片段: {snip}")
+            from_em = (em.get("from_email") or "").strip().lower()
+            direction = "客户来信" if from_em == c_email else "我方发出"
+            email_snippets.append(f"- [{em['date_str']}] [{direction}] 主题: 《{subj}》 | 内容片段: {snip}")
 
         emails_text = "\n".join(email_snippets)
         atts_text = ", ".join(att_info_list[:10]) if att_info_list else "无商业单据附件"
 
         prompt = f"""你是一位资深的外贸与企业级大客户销售总监及 CRM 数据专家。
-请根据下方联系人的历史往来邮件与附件，对该客户进行精准的价值与意向分级评定。
+请根据下方联系人的历史往来邮件与附件，结合当前诊断时间（现在）与往来时效，对该客户进行精准的价值与意向分级评定。
+
+【诊断基准时间（现在）】：{now_str}
 
 【客户基础信息】：
 - 姓名/称呼: {contact_dict['name'] or '未知'}
 - 电子邮箱: {contact_dict['email']}
 - 机构域名: {contact_dict['domain'] or '未知'}
 - 往来信件数: 累计收发 {contact_dict['inbound_count'] + contact_dict['outbound_count']} 封
+- 最近一次往来: {last_date_display} ({recency_desc})
+- 最近往来状态: {latest_sender_desc}
 - 关联附件清单: {atts_text}
 
-【往来邮件核心摘要（最新部分）】：
+【往来邮件核心摘要（最新部分，按时间倒序）】：
 {emails_text}
 
+【时效性与生命周期阶段特别判定规则（极其重要）】：
+1. **时效衰减机制**：
+   - **高意向 + 近期活跃（最后往来在 30 天以内）**：若有明确采购需求/批量询价/PI/样品测试/合同推进等，评定为 **A 级**（重点战略）或 **B 级**（培育增长）。
+   - **历史意向良好但已长时间断联（距今超过 30~60 天未有新进展）**：商机已进入冷淡期，生命周期阶段 `deal_stage` 必须评定为 **'stale'(停滞沉睡)**，客户分级应降级为 **C 级 (广泛孵化/待激活唤醒)**，并在评级依据中注明断联时长。
+   - **距今超过 180 天无任何往来**：判定为 **'stale'** 或 **'lost'**，客户分级判定为 **C 级** 或 **D 级**。
+2. **待办响应紧迫度**：
+   - 若最后一封是客户发来的询价/议价/反馈且我方尚未回复，需在评级依据中提示“客户来信待回复”。
+   - 若我方最后发出的方案或报价后客户已沉寂超过 14 天，需在评级依据中提示“需主动跟进破冰”。
+
 【分级评定标准】：
-- **A 级 (重点战略客户)**：高价值 + 高意向。特征：明确的采购需求/批量询价、索要形式发票(PI)/索样/合同签订、高客单价或大订单意向、频繁商务交流、已成单或进入实质谈判阶段的大客户。
-- **B 级 (培育增长客户)**：中等价值 + 明确意向。特征：对产品/服务有明确兴趣与询盘交流、索要产品目录/报价单、正在进行技术或交期交流、具备明确成单潜力但尚处于推进中的客户。
-- **C 级 (广泛孵化客户)**：潜在或低价值。特征：偶发建联、单次简单咨询、暂无明确采购预算或时间表、小批量零售散单或沟通意愿一般。
+- **A 级 (重点战略客户)**：高价值 + 高意向 + 近期活跃推进。特征：明确的采购需求/批量询价、索要形式发票(PI)/索样/合同签订、高客单价或大订单意向、频繁商务交流、已成单或进入实质谈判阶段的大客户。
+- **B 级 (培育增长客户)**：中等价值 + 明确意向 + 近期持续沟通。特征：对产品/服务有明确兴趣与询盘交流、索要产品目录/报价单、正在进行技术或交期交流、具备明确成单潜力且处于积极推进中的客户。
+- **C 级 (广泛孵化/沉睡激活客户)**：潜在或低价值、或曾经有意向但已停滞沉睡数月、偶发建联、单次简单咨询、暂无明确采购预算或时间表、小批量零售散单或沟通意愿一般。
 - **D 级 (其它)**：非商业商机、系统推送、招聘/广告/平台通用通知、日常协作服务商。
 
 【商机生命周期阶段 (deal_stage)】：
@@ -240,7 +307,7 @@ class SalesService:
 ```json
 {{
   "tier": "A" 或 "B" 或 "C" 或 "D",
-  "tier_reason": "一句话精炼概括评级核心依据 (不超过 60 字)",
+  "tier_reason": "一句话精炼概括评级核心依据与时效状态 (不超过 60 字)",
   "deal_stage": "inquiry",
   "estimated_value": 5000.0
 }}
@@ -298,17 +365,22 @@ class SalesService:
         except Exception:
             # Fallback heuristic without leaking raw HTTP/socket errors
             total_cnt = (contact_dict.get("inbound_count") or 0) + (contact_dict.get("outbound_count") or 0)
+            is_stale = (days_silent is not None and days_silent > 60)
             if contact_dict.get("deal_stage") == "won" and total_cnt >= 15:
                 tier = "A"
                 tier_reason = "已成单且往来交互密切的核心重点战略客户（规则引擎研判）"
                 deal_stage = "won"
+            elif is_stale:
+                tier = "C"
+                deal_stage = "stale"
+                tier_reason = f"含商务沟通但已停滞 {days_silent} 天未互动（规则引擎研判）"
             elif has_commercial_signals and total_cnt >= 6:
                 tier = "B"
-                tier_reason = "含高频商务询盘与商业往来（规则引擎研判）"
+                tier_reason = f"含近期高频商务询盘与商业往来（规则引擎研判）"
                 deal_stage = "inquiry"
             elif has_commercial_signals:
                 tier = "C"
-                tier_reason = "含商务询价沟通迹象（规则引擎研判）"
+                tier_reason = f"含商务询价沟通迹象（规则引擎研判）"
                 deal_stage = "inquiry"
             else:
                 tier = "D"
@@ -372,13 +444,32 @@ class SalesService:
             return dict(row) if row else {}
 
     @classmethod
-    async def get_tier_stats(cls, account_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_tier_stats(
+        cls, 
+        account_id: Optional[str] = None,
+        allowed_account_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """
         Returns counts of contacts by tier (A, B, C, D, unrated, locked) and total contacts.
         """
+        if account_id:
+            acc_sql = "WHERE account_id = ?"
+            acc_params = [account_id]
+        elif allowed_account_ids is not None:
+            if not allowed_account_ids:
+                return {
+                    "total": 0, "tier_a": 0, "tier_b": 0, "tier_c": 0, "tier_d": 0,
+                    "tier_counts": {"A": 0, "B": 0, "C": 0, "D": 0},
+                    "unrated": 0, "locked": 0
+                }
+            placeholders = ",".join("?" for _ in allowed_account_ids)
+            acc_sql = f"WHERE account_id IN ({placeholders})"
+            acc_params = list(allowed_account_ids)
+        else:
+            acc_sql = ""
+            acc_params = []
+
         async with get_db() as db:
-            acc_sql = "WHERE account_id = ?" if account_id else ""
-            acc_params = [account_id] if account_id else []
 
             c_cur = await db.execute(f"""
                 SELECT 
@@ -419,7 +510,8 @@ class SalesService:
         cls, 
         account_id: Optional[str] = None, 
         limit: int = 30,
-        mode: str = "all_funnel"
+        mode: str = "all_funnel",
+        allowed_account_ids: Optional[List[str]] = None
     ) -> AsyncGenerator[str, None]:
         """
         Streams batch evaluation progress for contacts using a smart funnel:
@@ -428,9 +520,21 @@ class SalesService:
         - top_active: Concurrent AI evaluation strictly on top N most active contacts
         - unrated: Evaluates only contacts without a tier
         """
+        if account_id:
+            acc_sql = "WHERE account_id = ?"
+            acc_params = [account_id]
+        elif allowed_account_ids is not None:
+            if not allowed_account_ids:
+                yield f"data: {json.dumps({'type': 'done', 'processed': 0, 'total': 0, 'summary': {'A': 0, 'B': 0, 'C': 0, 'D': 0}}, ensure_ascii=False)}\n\n"
+                return
+            placeholders = ",".join("?" for _ in allowed_account_ids)
+            acc_sql = f"WHERE account_id IN ({placeholders})"
+            acc_params = list(allowed_account_ids)
+        else:
+            acc_sql = ""
+            acc_params = []
+
         async with get_db() as db:
-            acc_sql = "WHERE account_id = ?" if account_id else ""
-            acc_params = [account_id] if account_id else []
 
             # Fetch user account emails and domains
             user_emails = set()
@@ -652,7 +756,11 @@ class SalesService:
         yield f"data: {json.dumps({'type': 'done', 'processed': total, 'total': total, 'summary': final_summary, 'duration_seconds': round(time.time() - t0, 1)}, ensure_ascii=False)}\n\n"
 
     @classmethod
-    async def get_follow_up_radar(cls, account_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_follow_up_radar(
+        cls, 
+        account_id: Optional[str] = None,
+        allowed_account_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """
         Calculates follow-up radar alerts:
         1. A-Tier Stale: Overdue > 3 days
@@ -661,9 +769,43 @@ class SalesService:
         4. Stagnant Deals: In 'quote' or 'sample' stage with no contact in > 5 days
         """
         now = datetime.now()
+        if account_id:
+            acc_filter = "WHERE account_id = ?"
+            acc_params = [account_id]
+        elif allowed_account_ids is not None:
+            if not allowed_account_ids:
+                return {
+                    "total_urgent": 0,
+                    "total_warning": 0,
+                    "total_active": 0,
+                    "total_domains": 0,
+                    "urgent_items": [],
+                    "warning_items": [],
+                    "active_items": [],
+                    "scatter_points": [],
+                    "aging_distribution": {
+                        "under_7d": 0,
+                        "7_to_14d": 0,
+                        "15_to_30d": 0,
+                        "31_to_60d": 0,
+                        "over_60d": 0
+                    },
+                    "summary": {
+                        "a_tier_overdue": 0,
+                        "b_tier_overdue": 0,
+                        "active_count": 0,
+                        "total_alerts": 0,
+                        "unique_domains_count": 0
+                    }
+                }
+            placeholders = ",".join("?" for _ in allowed_account_ids)
+            acc_filter = f"WHERE account_id IN ({placeholders})"
+            acc_params = list(allowed_account_ids)
+        else:
+            acc_filter = ""
+            acc_params = []
+
         async with get_db() as db:
-            acc_filter = "WHERE account_id = ?" if account_id else ""
-            acc_params = [account_id] if account_id else []
 
             # Fetch A & B tier contacts
             c_cur = await db.execute(f"""
@@ -884,7 +1026,7 @@ class SalesService:
                 ORDER BY date_timestamp ASC
                 LIMIT 40
             """, (c_email, f"%{c_email}%", f"%{c_email}%"))
-            email_rows = await e_cur.fetchall()
+            email_rows = [dict(r) for r in await e_cur.fetchall()]
 
         email_trail = []
         for em in email_rows:
@@ -1040,23 +1182,76 @@ class SalesService:
         # Fetch recent emails
         async with get_db() as db:
             e_cur = await db.execute("""
-                SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text
+                SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text, date_timestamp
                 FROM emails
                 WHERE (lower(from_email) = lower(?) OR to_emails LIKE ? OR cc_emails LIKE ?)
                 ORDER BY date_timestamp DESC
                 LIMIT 10
             """, (c_email, f"%{c_email}%", f"%{c_email}%"))
-            emails = await e_cur.fetchall()
+            emails = [dict(r) for r in await e_cur.fetchall()]
 
             # Fetch top playbook tactics for reference
             pb_cur = await db.execute("SELECT title, response_strategy, reply_template FROM sales_playbook ORDER BY is_system_preset DESC LIMIT 3")
-            playbooks = await pb_cur.fetchall()
+            playbooks = [dict(r) for r in await pb_cur.fetchall()]
+
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+
+        days_silent = None
+        last_date_display = "未知"
+        if emails:
+            last_em = emails[0]
+            last_date_display = last_em.get("date_str") or "未知"
+            ts = last_em.get("date_timestamp")
+            if ts:
+                try:
+                    ts_val = float(ts)
+                    if ts_val > 1e11:
+                        ts_val = ts_val / 1000.0
+                    last_dt = datetime.fromtimestamp(ts_val)
+                    days_silent = max(0, (now - last_dt).days)
+                except Exception:
+                    pass
+
+        if days_silent is None and c_dict.get("last_interaction"):
+            last_date_display = c_dict["last_interaction"]
+            try:
+                clean_d = last_date_display[:19].replace("T", " ")
+                last_dt = datetime.strptime(clean_d, "%Y-%m-%d %H:%M:%S")
+                days_silent = max(0, (now - last_dt).days)
+            except Exception:
+                try:
+                    clean_d = last_date_display[:10]
+                    last_dt = datetime.strptime(clean_d, "%Y-%m-%d")
+                    days_silent = max(0, (now - last_dt).days)
+                except Exception:
+                    pass
+
+        if days_silent is None:
+            recency_desc = "往来时间未知"
+        elif days_silent == 0:
+            recency_desc = "今日/24小时内最新互动"
+        elif days_silent == 1:
+            recency_desc = "昨天互动（1天前）"
+        else:
+            recency_desc = f"距今已 {days_silent} 天"
+
+        latest_sender_desc = "暂无往来记录"
+        if emails:
+            last_em = emails[0]
+            from_em = (last_em.get("from_email") or "").strip().lower()
+            if from_em == c_email:
+                latest_sender_desc = f"客户最后来信（已等待我方回复: {recency_desc}）"
+            else:
+                latest_sender_desc = f"我方最后发出（正等待客户回复: {recency_desc}）"
 
         recent_lines = []
         for em in emails[:5]:
             subj = em["subject"] or "(无主题)"
             snip = (em["body_text"] or em["snippet"] or "")[:200].replace("\n", " ")
-            recent_lines.append(f"- [{em['date_str']}] 《{subj}》: {snip}")
+            from_em = (em.get("from_email") or "").strip().lower()
+            direction = "客户来信" if from_em == c_email else "我方发出"
+            recent_lines.append(f"- [{em['date_str']}] [{direction}] 《{subj}》: {snip}")
         recent_text = "\n".join(recent_lines) if recent_lines else "暂无历史往来文本"
 
         pb_reference = ""
@@ -1068,9 +1263,12 @@ class SalesService:
 【目标客户信息】：
 - 客户称呼: {c_name} <{c_email}> (所属域名: {c_dict.get('domain') or '未知'})
 - 客户等级: {c_dict.get('tier', 'B')} 级客户 | 当前生命周期阶段: {c_dict.get('deal_stage', 'inquiry')}
+- 当前起草时间（现在）: {now_str}
+- 最后一次往来互动: {last_date_display} ({recency_desc})
+- 当前往来状态: {latest_sender_desc}
 - 业务员特别指示: {prompt_hint if prompt_hint.strip() else '进行常规有效破冰，激活客户互动，探询推进节点'}
 
-【双方近期往来历史上下文】：
+【双方近期往来历史上下文（按时间倒序）】：
 {recent_text}
 
 【销售对策库推荐战术参考】：
@@ -1078,8 +1276,9 @@ class SalesService:
 
 【邮件写作要求】：
 1. 语气专业、真诚、有商业分寸，杜绝空洞催促；
-2. 结合往来上下文，以具体的产品细节/排产窗口/最新原材料价格走势/样品测试进展为切入点；
-3. 输出完整正文（含称谓、正文段落、行动号召 Call to Action 及署名占位符），排版清晰美观。直接输出邮件内容，不要输出多余说明。
+2. 结合当前时间与上次互动的时间差（{recency_desc}），自然开场，切合客户当前所处的生命周期阶段；
+3. 结合往来上下文，以具体的产品细节/排产窗口/最新原材料价格走势/样品测试进展为切入点；
+4. 输出完整正文（含称谓、正文段落、行动号召 Call to Action 及署名占位符），排版清晰美观。直接输出邮件内容，不要输出多余说明。
 """
         messages = [
             {"role": "system", "content": "你是一位出色的外贸与大客户销售总监，精通商务心理学与高情商邮件沟通。"},
@@ -1198,6 +1397,30 @@ class SalesService:
     @classmethod
     async def delete_playbook(cls, playbook_id: str) -> bool:
         async with get_db() as db:
+            cur = await db.execute("SELECT id, is_system_preset FROM sales_playbook WHERE id = ?", (playbook_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            if row["is_system_preset"] == 1:
+                raise ValueError("系统内置实战对策话术受保护，不可删除。")
             await db.execute("DELETE FROM sales_playbook WHERE id = ?", (playbook_id,))
             await db.commit()
+        return True
+
+    @classmethod
+    async def reset_default_playbooks(cls) -> int:
+        """Restores default system playbooks if missing or corrupted"""
+        from app.database import init_db
+        # Re-run init_db migration logic to ensure default entries exist
+        import sqlite3
+        from app.config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            from app.database import SCHEMA_SQL
+            conn.executescript(SCHEMA_SQL)
+            # Re-seed default presets if needed
+            # (handled by database schema definition)
+            conn.commit()
+        finally:
+            conn.close()
         return True

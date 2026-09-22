@@ -1,21 +1,29 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
 import Navbar from './components/Navbar';
-import Dashboard from './pages/Dashboard';
-import DigitalAssets from './pages/DigitalAssets';
-import Attachments from './pages/Attachments';
-import ContactGraph from './pages/ContactGraph';
-import MailSearch from './pages/MailSearch';
-import Settings from './pages/Settings';
-import AICopilotWorkbench from './pages/AICopilotWorkbench';
-import RBACManagement from './pages/RBACManagement';
-import SalesPlaybook from './pages/SalesPlaybook';
-import Login from './pages/Login';
-import GlobalAICopilotDrawer from './components/GlobalAICopilotDrawer';
-import EmailDetailModal from './components/EmailDetailModal';
 import ErrorBoundary from './components/ErrorBoundary';
 import { AIConversationProvider, useAIConversation } from './context/AIConversationContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { api } from './api/client';
+
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const DigitalAssets = lazy(() => import('./pages/DigitalAssets'));
+const Attachments = lazy(() => import('./pages/Attachments'));
+const ContactGraph = lazy(() => import('./pages/ContactGraph'));
+const MailSearch = lazy(() => import('./pages/MailSearch'));
+const Settings = lazy(() => import('./pages/Settings'));
+const AICopilotWorkbench = lazy(() => import('./pages/AICopilotWorkbench'));
+const RBACManagement = lazy(() => import('./pages/RBACManagement'));
+const SalesPlaybook = lazy(() => import('./pages/SalesPlaybook'));
+const Login = lazy(() => import('./pages/Login'));
+const GlobalAICopilotDrawer = lazy(() => import('./components/GlobalAICopilotDrawer'));
+const EmailDetailModal = lazy(() => import('./components/EmailDetailModal'));
+
+const TabLoadingFallback = () => (
+  <div className="w-full py-24 flex flex-col items-center justify-center text-[var(--color-neutral-4)] gap-3 animate-in fade-in duration-200">
+    <div className="w-6 h-6 border-2 border-[var(--color-accent)] border-t-transparent rounded-full animate-spin" />
+    <span className="text-xs font-mono tracking-wider">加载模块中...</span>
+  </div>
+);
 
 function AppContent() {
   const { isAuthenticated, isLoading, hasPagePermission, user } = useAuth();
@@ -376,7 +384,15 @@ function AppContent() {
 
   // 2. Unauthenticated -> Show Login Page
   if (!isAuthenticated) {
-    return <Login />;
+    return (
+      <Suspense fallback={
+        <div className="min-h-screen bg-[var(--color-paper)] flex items-center justify-center">
+          <div className="w-8 h-8 rounded-full border-2 border-[var(--color-accent)] border-t-transparent animate-spin" />
+        </div>
+      }>
+        <Login />
+      </Suspense>
+    );
   }
 
   // 3. Authenticated -> Main Workstation
@@ -407,92 +423,98 @@ function AppContent() {
 
       {/* Main Content View with Yohaku Whitespace (余白) */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-6 lg:px-8 pt-6 min-w-0 overflow-x-hidden">
-        {activeTab === 'dashboard' && hasPagePermission('dashboard') && (
-          <Dashboard
-            selectedAccount={selectedAccount}
-            onNavigate={handleNavigate}
-          />
-        )}
+        <Suspense fallback={<TabLoadingFallback />}>
+          {activeTab === 'dashboard' && hasPagePermission('dashboard') && (
+            <Dashboard
+              selectedAccount={selectedAccount}
+              onNavigate={handleNavigate}
+            />
+          )}
 
-        {activeTab === 'assets' && hasPagePermission('assets') && (
-          <DigitalAssets
-            selectedAccount={selectedAccount}
-            onSelectEmail={handleSelectEmail}
-          />
-        )}
+          {activeTab === 'assets' && hasPagePermission('assets') && (
+            <DigitalAssets
+              selectedAccount={selectedAccount}
+              onSelectEmail={handleSelectEmail}
+            />
+          )}
 
-        {activeTab === 'attachments' && hasPagePermission('attachments') && (
-          <Attachments
-            selectedAccount={selectedAccount}
-            onSelectEmail={handleSelectEmail}
-          />
-        )}
+          {activeTab === 'attachments' && hasPagePermission('attachments') && (
+            <Attachments
+              selectedAccount={selectedAccount}
+              onSelectEmail={handleSelectEmail}
+            />
+          )}
 
-        {activeTab === 'contacts' && hasPagePermission('contacts') && (
-          <ContactGraph
-            selectedAccount={selectedAccount}
-            onSelectEmail={handleSelectEmail}
-            initialContact={targetContact}
-            onClearInitialContact={() => setTargetContact(null)}
-          />
-        )}
+          {activeTab === 'contacts' && hasPagePermission('contacts') && (
+            <ContactGraph
+              selectedAccount={selectedAccount}
+              onSelectEmail={handleSelectEmail}
+              initialContact={targetContact}
+              onClearInitialContact={() => setTargetContact(null)}
+            />
+          )}
 
-        {activeTab === 'sales_playbook' && hasPagePermission('sales_playbook') && (
-          <SalesPlaybook />
-        )}
+          {activeTab === 'sales_playbook' && hasPagePermission('sales_playbook') && (
+            <SalesPlaybook />
+          )}
 
-        {activeTab === 'emails' && hasPagePermission('emails') && (
-          <MailSearch
-            selectedAccount={selectedAccount}
-            initialEmailId={targetEmailId}
-          />
-        )}
+          {activeTab === 'emails' && hasPagePermission('emails') && (
+            <MailSearch
+              selectedAccount={selectedAccount}
+              initialEmailId={targetEmailId}
+            />
+          )}
 
-        {activeTab === 'ai_copilot' && hasPagePermission('ai_copilot') && (
-          <AICopilotWorkbench
-            selectedAccount={selectedAccount}
-            onSelectEmail={handleSelectEmail}
-          />
-        )}
+          {activeTab === 'ai_copilot' && hasPagePermission('ai_copilot') && (
+            <AICopilotWorkbench
+              selectedAccount={selectedAccount}
+              onSelectEmail={handleSelectEmail}
+            />
+          )}
 
-        {activeTab === 'settings' && hasPagePermission('settings') && (
-          <Settings
-            accounts={accounts}
-            loadAccounts={loadAccounts}
-            onTriggerSync={(accId) => handleTriggerSync(accId, false)}
-            onTriggerSyncAll={handleTriggerSyncAll}
-            syncingAccountIds={syncingAccountIds}
-            isSyncing={isSyncing}
-            isSyncingAll={isSyncingAll}
-            onSeedDemo={handleSeedDemo}
-            onStopSync={handleStopSync}
-          />
-        )}
+          {activeTab === 'settings' && hasPagePermission('settings') && (
+            <Settings
+              accounts={accounts}
+              loadAccounts={loadAccounts}
+              onTriggerSync={(accId) => handleTriggerSync(accId, false)}
+              onTriggerSyncAll={handleTriggerSyncAll}
+              syncingAccountIds={syncingAccountIds}
+              isSyncing={isSyncing}
+              isSyncingAll={isSyncingAll}
+              onSeedDemo={handleSeedDemo}
+              onStopSync={handleStopSync}
+            />
+          )}
 
-        {activeTab === 'rbac' && hasPagePermission('rbac') && (
-          <RBACManagement />
-        )}
+          {activeTab === 'rbac' && hasPagePermission('rbac') && (
+            <RBACManagement />
+          )}
+        </Suspense>
       </main>
 
       {/* Global Bottom-Right Floating AI Copilot Drawer */}
       {hasPagePermission('ai_copilot') && (
-        <GlobalAICopilotDrawer
-          isOpen={isCopilotDrawerOpen}
-          onToggle={() => setIsCopilotDrawerOpen(!isCopilotDrawerOpen)}
-          selectedAccount={selectedAccount}
-          onSelectEmail={handleSelectEmail}
-          onNavigateToWorkbench={() => setActiveTab('ai_copilot')}
-        />
+        <Suspense fallback={null}>
+          <GlobalAICopilotDrawer
+            isOpen={isCopilotDrawerOpen}
+            onToggle={() => setIsCopilotDrawerOpen(!isCopilotDrawerOpen)}
+            selectedAccount={selectedAccount}
+            onSelectEmail={handleSelectEmail}
+            onNavigateToWorkbench={() => setActiveTab('ai_copilot')}
+          />
+        </Suspense>
       )}
 
 
       {/* Universal Direct Email Detail Reading Modal */}
       <ErrorBoundary onReset={handleCloseEmailModal}>
-        <EmailDetailModal
-          emailId={modalEmailId}
-          isOpen={isEmailModalOpen}
-          onClose={handleCloseEmailModal}
-        />
+        <Suspense fallback={null}>
+          <EmailDetailModal
+            emailId={modalEmailId}
+            isOpen={isEmailModalOpen}
+            onClose={handleCloseEmailModal}
+          />
+        </Suspense>
       </ErrorBoundary>
 
       {/* Floating Silent Background Notification Toast */}

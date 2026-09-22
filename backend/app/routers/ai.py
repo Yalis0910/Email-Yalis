@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from app.database import get_db
 from app.services.ai_service import AIService, PRESETS
 from app.dependencies import get_current_user, require_permission, check_account_access, get_authorized_account_ids
 
@@ -205,15 +206,35 @@ async def get_enabled_models():
     """Returns all active models grouped by platform for chat selector"""
     return await AIService.get_enabled_models()
 
+async def verify_email_access(email_id: str, current_user: Dict[str, Any]) -> str:
+    async with get_db() as db:
+        async with db.execute("SELECT account_id FROM emails WHERE id = ?", (email_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="未找到该邮件")
+            account_id = row["account_id"]
+    check_account_access(account_id, current_user)
+    return account_id
+
 @router.get("/emails/{email_id}/insights")
-async def get_email_insights(email_id: str):
+async def get_email_insights(
+    email_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """Fetches cached summary & action items for an email"""
+    await verify_email_access(email_id, current_user)
     insight = await AIService.get_email_insight(email_id)
     return {"has_insight": bool(insight), "insight": insight}
 
 @router.post("/emails/{email_id}/summarize")
-async def summarize_email_stream(email_id: str, force_refresh: bool = False, model: Optional[str] = Query(None)):
+async def summarize_email_stream(
+    email_id: str,
+    force_refresh: bool = False,
+    model: Optional[str] = Query(None),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """Streams single email summary and action items via SSE"""
+    await verify_email_access(email_id, current_user)
     generator = AIService.stream_email_summary(email_id, force_refresh=force_refresh, model=model)
     return StreamingResponse(
         generator,
@@ -226,8 +247,13 @@ async def summarize_email_stream(email_id: str, force_refresh: bool = False, mod
     )
 
 @router.post("/emails/{email_id}/reply")
-async def generate_email_reply_stream(email_id: str, data: AIReplyRequest):
+async def generate_email_reply_stream(
+    email_id: str,
+    data: AIReplyRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """Streams email reply draft via SSE"""
+    await verify_email_access(email_id, current_user)
     generator = AIService.stream_email_reply(
         email_id=email_id,
         tone=data.tone or "professional",

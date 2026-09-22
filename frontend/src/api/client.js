@@ -300,19 +300,19 @@ export const api = {
   // ================= Sales CRM API =================
   getTierStats: (accountId = null) => request(`/api/sales/contacts/tier-stats${buildQuery({ account_id: accountId })}`),
   getSalesRadar: (accountId = null) => request(`/api/sales/radar${buildQuery({ account_id: accountId })}`),
-  updateContactTier: (contactId, data) => request(`/api/sales/contacts/${contactId}/tier`, {
+  updateContactTier: (contactId, data) => request(`/api/sales/contacts/${encodeURIComponent(contactId)}/tier`, {
     method: 'POST',
     body: JSON.stringify(data)
   }),
   evaluateContactTier: (contactId, forceRefresh = false, model = null) => request(
-    `/api/sales/contacts/${contactId}/evaluate-tier${buildQuery({ force_refresh: forceRefresh, model })}`,
+    `/api/sales/contacts/${encodeURIComponent(contactId)}/evaluate-tier${buildQuery({ force_refresh: forceRefresh, model })}`,
     { method: 'POST' }
   ),
-  reviewContactDeal: (contactId, data) => request(`/api/sales/contacts/${contactId}/review-deal`, {
+  reviewContactDeal: (contactId, data) => request(`/api/sales/contacts/${encodeURIComponent(contactId)}/review-deal`, {
     method: 'POST',
     body: JSON.stringify(data)
   }),
-  getContactDealReviews: (contactId) => request(`/api/sales/contacts/${contactId}/reviews`),
+  getContactDealReviews: (contactId) => request(`/api/sales/contacts/${encodeURIComponent(contactId)}/reviews`),
   getSalesPlaybooks: (scenarioType = null, search = null) => request(
     `/api/sales/playbook${buildQuery({ scenario_type: scenarioType, search })}`
   ),

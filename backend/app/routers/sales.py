@@ -56,7 +56,11 @@ async def get_tier_stats(
 ):
     """Returns current counts of contacts in A, B, C, D tiers and unrated counts"""
     check_account_access(account_id, current_user)
-    return await SalesService.get_tier_stats(account_id=account_id)
+    authorized = get_authorized_account_ids(current_user)
+    return await SalesService.get_tier_stats(
+        account_id=account_id,
+        allowed_account_ids=list(authorized) if authorized is not None else None
+    )
 
 @router.get("/radar")
 async def get_sales_radar(
@@ -65,7 +69,11 @@ async def get_sales_radar(
 ):
     """Returns follow-up radar alerts for overdue high-potential leads"""
     check_account_access(account_id, current_user)
-    return await SalesService.get_follow_up_radar(account_id=account_id)
+    authorized = get_authorized_account_ids(current_user)
+    return await SalesService.get_follow_up_radar(
+        account_id=account_id,
+        allowed_account_ids=list(authorized) if authorized is not None else None
+    )
 
 @router.post("/contacts/{contact_id}/tier")
 async def update_contact_tier(
@@ -181,10 +189,12 @@ async def batch_tier_stream(
 ):
     """Streams batch contact classification progress"""
     check_account_access(data.account_id, current_user)
+    authorized = get_authorized_account_ids(current_user)
     generator = SalesService.batch_evaluate_contacts(
         account_id=data.account_id,
         limit=data.limit or 50,
-        mode=data.mode or "all_funnel"
+        mode=data.mode or "all_funnel",
+        allowed_account_ids=list(authorized) if authorized is not None else None
     )
     return StreamingResponse(
         generator,
@@ -230,6 +240,19 @@ async def delete_sales_playbook(
     playbook_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Deletes a sales playbook entry"""
-    ok = await SalesService.delete_playbook(playbook_id)
-    return {"status": "ok"}
+    """Deletes a sales playbook entry with protection for system presets"""
+    try:
+        ok = await SalesService.delete_playbook(playbook_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="未找到指定话术条目")
+        return {"status": "ok"}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+@router.post("/playbook/reset-presets")
+async def reset_sales_playbook_presets(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Restores default system playbooks if missing"""
+    await SalesService.reset_default_playbooks()
+    return {"status": "ok", "message": "系统内置实战话术已重新校准恢复"}

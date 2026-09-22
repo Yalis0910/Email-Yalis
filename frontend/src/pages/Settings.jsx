@@ -119,7 +119,7 @@ const AI_PRESETS = {
     desc: '超高性价比与严密推理，推荐国内首选'
   },
   custom: {
-    name: '自定义 OpenAI 接口',
+    name: '自定义接口',
     url: '',
     model: '',
     desc: '支持任何兼容 OpenAI /chat/completions 规范的第三方模型接口'
@@ -342,23 +342,8 @@ export default function Settings({
         base_url: 'https://api.deepseek.com/v1',
         enabled_models: ['deepseek-chat', 'deepseek-reasoner']
       },
-      siliconflow: {
-        name: 'SiliconFlow 硅基流动',
-        base_url: 'https://api.siliconflow.cn/v1',
-        enabled_models: []
-      },
-      agnes: {
-        name: 'Agnes AI',
-        base_url: 'https://api.agnes.ai/v1',
-        enabled_models: []
-      },
-      ollama: {
-        name: 'Ollama (本地)',
-        base_url: 'http://localhost:11434/v1',
-        enabled_models: []
-      },
       custom: {
-        name: '自定义 OpenAI 接口',
+        name: '自定义接口',
         base_url: '',
         enabled_models: []
       }
@@ -869,12 +854,26 @@ export default function Settings({
                   return (
                     <div key={acc.id} className="py-3.5 flex items-center justify-between gap-4">
                       <div className="flex items-center space-x-3.5 min-w-0">
-                        <div className="w-9 h-9 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] flex items-center justify-center text-xs font-mono font-medium text-[var(--color-neutral-8)] shrink-0 shadow-2xs">
+                        <div className="w-9 h-9 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] flex items-center justify-center text-xs font-mono font-medium text-[var(--color-neutral-8)] shrink-0 shadow-2xs overflow-hidden relative">
                           {acc.avatar_url ? (
-                            <img src={acc.avatar_url} alt="" className="w-full h-full object-cover rounded-full" />
-                          ) : (
-                            acc.email.slice(0, 2).toUpperCase()
-                          )}
+                            <img
+                              src={acc.avatar_url}
+                              alt={acc.display_name || acc.email}
+                              referrerPolicy="no-referrer"
+                              onError={(e) => {
+                                e.currentTarget.style.display = 'none';
+                                const fallback = e.currentTarget.nextElementSibling;
+                                if (fallback) fallback.style.display = 'flex';
+                              }}
+                              className="w-full h-full object-cover rounded-full"
+                            />
+                          ) : null}
+                          <span
+                            className="w-full h-full flex items-center justify-center text-xs font-mono font-medium text-[var(--color-neutral-8)] select-none"
+                            style={{ display: acc.avatar_url ? 'none' : 'flex' }}
+                          >
+                            {acc.email.slice(0, 2).toUpperCase()}
+                          </span>
                         </div>
                         <div className="min-w-0">
                           <div className="text-xs font-medium text-[var(--color-neutral-10)] flex items-center gap-2 flex-wrap">
@@ -1537,9 +1536,6 @@ export default function Settings({
                   <div className="flex flex-wrap gap-1.5">
                     {[
                       { key: 'deepseek', label: '+ DeepSeek' },
-                      { key: 'siliconflow', label: '+ 硅基流动' },
-                      { key: 'agnes', label: '+ Agnes AI' },
-                      { key: 'ollama', label: '+ Ollama' },
                       { key: 'custom', label: '+ 自定义接口' }
                     ].map(btn => (
                       <button
@@ -1642,7 +1638,7 @@ export default function Settings({
                             type={showApiKeyMap[currentPlatform.id] ? 'text' : 'password'}
                             value={currentPlatform.api_key}
                             onChange={(e) => handleUpdatePlatform(currentPlatform.id, 'api_key', e.target.value)}
-                            placeholder={currentPlatform.has_api_key ? '留空保持已有密钥不变' : 'sk-... (本地 Ollama 可留空)'}
+                            placeholder={currentPlatform.has_api_key ? '留空保持已有密钥不变' : 'sk-... (如无需密钥可留空)'}
                             className="w-full pl-3 pr-8 py-1.5 text-xs font-mono rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-neutral-10)] focus:outline-none focus:border-[var(--color-accent)] shadow-2xs"
                           />
                           <button

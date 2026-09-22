@@ -7,7 +7,11 @@ import {
   ExternalLink, 
   Check,
   Sparkles,
-  RefreshCw
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight
 } from 'lucide-react';
 import { api } from '../api/client';
 
@@ -25,6 +29,27 @@ const CATEGORIES = [
 
 const CATEGORY_LABEL_MAP = Object.fromEntries(CATEGORIES.map(c => [c.key, c.label]));
 
+const getPageNumbers = (current, total) => {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const pages = [];
+  pages.push(1);
+  if (current > 3) {
+    pages.push('...');
+  }
+  const start = Math.max(2, current - 1);
+  const end = Math.min(total - 1, current + 1);
+  for (let i = start; i <= end; i++) {
+    pages.push(i);
+  }
+  if (current < total - 2) {
+    pages.push('...');
+  }
+  pages.push(total);
+  return pages;
+};
+
 export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
   const [activeSubTab, setActiveSubTab] = useState('assets'); // 'assets' | 'subscriptions'
   const [assets, setAssets] = useState([]);
@@ -33,6 +58,8 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
   const [selectedCategory, setSelectedCategory] = useState('');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(30);
+  const [jumpPage, setJumpPage] = useState('');
   const [total, setTotal] = useState(0);
   const [counts, setCounts] = useState({ assets: 0, subscriptions: 0 });
   const [categoryCounts, setCategoryCounts] = useState({});
@@ -40,6 +67,7 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
 
   // Prefetch baseline counts for both tabs and category distribution on account change or mount
   useEffect(() => {
+    setPage(1);
     loadTabCounts();
   }, [selectedAccount]);
 
@@ -47,12 +75,12 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
     try {
       const [assetsRes, subsRes, catsRes] = await Promise.all([
         api.getDigitalAssets({ account_id: selectedAccount || '', limit: 1 }),
-        api.getSubscriptions({ account_id: selectedAccount || '' }),
+        api.getSubscriptions({ account_id: selectedAccount || '', limit: 1 }),
         api.getDigitalAssetCategories(selectedAccount || '')
       ]);
       setCounts({
-        assets: assetsRes.total || 0,
-        subscriptions: Array.isArray(subsRes) ? subsRes.length : 0
+        assets: assetsRes?.total || 0,
+        subscriptions: Array.isArray(subsRes) ? subsRes.length : (subsRes?.total || 0)
       });
       const catMap = {};
       (catsRes || []).forEach(item => {
@@ -70,7 +98,7 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
     } else {
       loadSubscriptions();
     }
-  }, [selectedAccount, activeSubTab, selectedCategory, search, page]);
+  }, [selectedAccount, activeSubTab, selectedCategory, search, page, pageSize]);
 
   const loadAssets = async () => {
     try {
@@ -80,7 +108,7 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
         category: selectedCategory,
         search,
         page,
-        limit: 30
+        limit: pageSize
       });
       setAssets(res.items || []);
       setTotal(res.total || 0);
@@ -99,17 +127,50 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
       setLoading(true);
       const res = await api.getSubscriptions({
         account_id: selectedAccount || '',
-        search
+        search,
+        page,
+        limit: pageSize
       });
-      const items = res || [];
-      setSubscriptions(items);
-      if (!search) {
-        setCounts(prev => ({ ...prev, subscriptions: items.length }));
+      if (Array.isArray(res)) {
+        setSubscriptions(res);
+        setTotal(res.length);
+        if (!search) {
+          setCounts(prev => ({ ...prev, subscriptions: res.length }));
+        }
+      } else {
+        setSubscriptions(res.items || []);
+        setTotal(res.total || 0);
+        if (!search) {
+          setCounts(prev => ({ ...prev, subscriptions: res.total || 0 }));
+        }
       }
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  const handlePageChange = (newPage) => {
+    if (newPage >= 1 && newPage <= totalPages && newPage !== page) {
+      setPage(newPage);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  const handlePageSizeChange = (newSize) => {
+    setPageSize(newSize);
+    setPage(1);
+  };
+
+  const handleJump = (e) => {
+    e.preventDefault();
+    const p = parseInt(jumpPage, 10);
+    if (!isNaN(p) && p >= 1 && p <= totalPages) {
+      handlePageChange(p);
+      setJumpPage('');
     }
   };
 
@@ -181,7 +242,7 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
         {/* Subtabs */}
         <div className="flex p-1 rounded-lg bg-[var(--color-surface-subtle)] border border-[var(--color-border)] max-w-full overflow-x-auto">
           <button
-            onClick={() => { setActiveSubTab('assets'); setPage(1); }}
+            onClick={() => { setActiveSubTab('assets'); setPage(1); setJumpPage(''); }}
             className={`flex-1 sm:flex-initial text-center whitespace-nowrap px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
               activeSubTab === 'assets'
                 ? 'bg-[var(--color-surface)] text-[var(--color-neutral-10)] shadow-sm'
@@ -191,14 +252,14 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
             SaaS 与服务账号 ({activeSubTab === 'assets' && (search || selectedCategory) ? total : counts.assets})
           </button>
           <button
-            onClick={() => { setActiveSubTab('subscriptions'); setPage(1); }}
+            onClick={() => { setActiveSubTab('subscriptions'); setPage(1); setJumpPage(''); }}
             className={`flex-1 sm:flex-initial text-center whitespace-nowrap px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
               activeSubTab === 'subscriptions'
                 ? 'bg-[var(--color-surface)] text-[var(--color-neutral-10)] shadow-sm'
                 : 'text-[var(--color-neutral-6)] hover:text-[var(--color-neutral-9)]'
             }`}
           >
-            经常性扣费与订阅 ({activeSubTab === 'subscriptions' && search ? subscriptions.length : counts.subscriptions})
+            经常性扣费与订阅 ({activeSubTab === 'subscriptions' && search ? total : counts.subscriptions})
           </button>
         </div>
 
@@ -370,6 +431,121 @@ export default function DigitalAssets({ selectedAccount, onSelectEmail }) {
             </div>
           </div>
         )
+      )}
+
+      {/* Pagination Toolbar */}
+      {!loading && total > 0 && (
+        <div className="yohaku-card p-4 flex flex-col md:flex-row items-center justify-between gap-4 text-xs font-mono text-[var(--color-neutral-7)]">
+          {/* Left: Total & Page Info */}
+          <div className="flex items-center gap-2.5 tabular-nums">
+            <span>
+              共 <strong className="text-[var(--color-neutral-10)] font-medium">{total}</strong> {activeSubTab === 'subscriptions' ? '条账单记录' : '个服务资产'}
+            </span>
+            <span className="text-[var(--color-neutral-4)]">|</span>
+            <span>
+              第 <strong className="text-[var(--color-neutral-10)] font-medium">{page}</strong> / {totalPages} 页
+            </span>
+          </div>
+
+          {/* Right: Controls */}
+          <div className="flex items-center flex-wrap justify-center gap-2 sm:gap-3">
+            {/* Page Size Selector */}
+            <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-neutral-6)]">
+              <span>每页</span>
+              <select
+                value={pageSize}
+                onChange={(e) => handlePageSizeChange(Number(e.target.value))}
+                className="bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-neutral-9)] text-xs rounded px-2 py-1 outline-none focus:border-[var(--color-accent)] cursor-pointer"
+              >
+                <option value={30}>30 条</option>
+                <option value={60}>60 条</option>
+                <option value={90}>90 条</option>
+                <option value={120}>120 条</option>
+              </select>
+            </div>
+
+            {/* Pagination Navigation */}
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => handlePageChange(1)}
+                disabled={page <= 1}
+                className="p-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-subtle)] text-[var(--color-neutral-7)] disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
+                title="第一页"
+              >
+                <ChevronsLeft className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => handlePageChange(page - 1)}
+                disabled={page <= 1}
+                className="px-2 py-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-subtle)] text-[var(--color-neutral-7)] disabled:opacity-30 disabled:pointer-events-none transition-colors flex items-center gap-0.5 text-[11px] cursor-pointer"
+                title="上一页"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+                <span>上一页</span>
+              </button>
+
+              <div className="flex items-center gap-1 mx-0.5">
+                {getPageNumbers(page, totalPages).map((p, idx) => (
+                  p === '...' ? (
+                    <span key={`ellipsis-${idx}`} className="px-1 text-[var(--color-neutral-4)] select-none text-xs">...</span>
+                  ) : (
+                    <button
+                      key={p}
+                      onClick={() => handlePageChange(p)}
+                      className={`min-w-[28px] h-7 px-1.5 rounded text-xs tabular-nums transition-colors cursor-pointer ${
+                        page === p
+                          ? 'bg-[var(--color-accent)] text-white font-medium shadow-sm'
+                          : 'bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-neutral-7)] hover:bg-[var(--color-surface-subtle)]'
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  )
+                ))}
+              </div>
+
+              <button
+                onClick={() => handlePageChange(page + 1)}
+                disabled={page >= totalPages}
+                className="px-2 py-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-subtle)] text-[var(--color-neutral-7)] disabled:opacity-30 disabled:pointer-events-none transition-colors flex items-center gap-0.5 text-[11px] cursor-pointer"
+                title="下一页"
+              >
+                <span>下一页</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => handlePageChange(totalPages)}
+                disabled={page >= totalPages}
+                className="p-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-subtle)] text-[var(--color-neutral-7)] disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
+                title="最后一页"
+              >
+                <ChevronsRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Jump Input */}
+            <form onSubmit={handleJump} className="flex items-center gap-1.5 ml-1">
+              <span className="text-[11px] text-[var(--color-neutral-5)]">跳至</span>
+              <input
+                type="number"
+                min={1}
+                max={totalPages}
+                value={jumpPage}
+                onChange={(e) => setJumpPage(e.target.value)}
+                placeholder={String(page)}
+                className="w-12 bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-neutral-9)] text-xs rounded px-1.5 py-1 text-center outline-none focus:border-[var(--color-accent)] tabular-nums"
+              />
+              <span className="text-[11px] text-[var(--color-neutral-5)]">页</span>
+              <button
+                type="submit"
+                disabled={!jumpPage}
+                className="px-2 py-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-subtle)] text-[11px] text-[var(--color-neutral-8)] disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
+              >
+                跳转
+              </button>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -4,12 +4,14 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
+AVATARS_DIR = DATA_DIR / "avatars"
 DB_PATH = DATA_DIR / "email_assets.db"
 CREDENTIALS_FILE = DATA_DIR / "credentials.json"
 
 # Ensure runtime directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+AVATARS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Gmail OAuth Scopes (Read-only for security)
 GMAIL_SCOPES = [

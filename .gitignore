@@ -101,3 +101,5 @@ logs/
 *.tmp
 *.TMP
 *~*
+scratch/
+

@@ -277,9 +277,11 @@ export default function ContactTimelineDrawer({
         setDealStage(res.deal_stage || 'lead');
         setTierLocked(false);
         onTierUpdated?.();
+      } else {
+        alert('评估评级失败: ' + (res?.error || '诊断未返回有效评级结果'));
       }
     } catch (err) {
-      alert('评估评级失败: ' + err);
+      alert('评估评级失败: ' + (err.message || err));
     } finally {
       setIsEvaluatingTier(false);
     }

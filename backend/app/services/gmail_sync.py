@@ -129,6 +129,13 @@ class GmailSyncService:
             except Exception:
                 body_text = body_html[:1000]
 
+        # Prevent huge payloads (e.g. multi-megabyte inline base64 images) from blowing up DB & RAM
+        MAX_BODY_SAVE_SIZE = 300 * 1024
+        if len(body_text) > MAX_BODY_SAVE_SIZE:
+            body_text = body_text[:MAX_BODY_SAVE_SIZE] + "\n\n...[邮件正文过长，系统已安全截断保护存储与网络性能]..."
+        if len(body_html) > MAX_BODY_SAVE_SIZE:
+            body_html = body_html[:MAX_BODY_SAVE_SIZE]
+
         return body_text, body_html, attachments
 
     @classmethod
@@ -144,9 +151,10 @@ class GmailSyncService:
                 return
 
             service = build("gmail", "v1", credentials=creds)
+            loop = asyncio.get_running_loop()
 
-            # Get latest profile & historyId
-            profile = service.users().getProfile(userId="me").execute()
+            # Get latest profile & historyId in executor to prevent event loop stalls
+            profile = await loop.run_in_executor(None, service.users().getProfile(userId="me").execute)
             latest_history_id = profile.get("historyId")
 
             await notify_progress(account_id, "syncing", 0, 0, "正在检索云端邮件列表...")
@@ -168,7 +176,7 @@ class GmailSyncService:
                     pageToken=page_token,
                     maxResults=500
                 )
-                res = req.execute()
+                res = await loop.run_in_executor(None, req.execute)
                 messages = res.get("messages", [])
                 if messages:
                     all_messages.extend(messages)
@@ -218,6 +226,7 @@ class GmailSyncService:
             # Batch fetch messages in safe chunks of 20 with rate-limiting & backoff
             chunk_size = 20
             processed_count = 0
+            all_saved_ids = []
 
             for i in range(0, len(new_messages), chunk_size):
                 chunk = new_messages[i:i + chunk_size]
@@ -246,12 +255,13 @@ class GmailSyncService:
                             callback=callback
                         )
 
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, batch.execute)
 
                     if fetched_details:
                         await cls._save_batch_messages(account_id, fetched_details)
-                        saved_ids = {m.get("id") for m in fetched_details}
+                        saved_ids = {m.get("id") for m in fetched_details if m.get("id")}
+                        all_saved_ids.extend(list(saved_ids))
                         remaining_in_chunk = [m for m in remaining_in_chunk if m["id"] not in saved_ids]
 
                     if remaining_in_chunk:
@@ -289,9 +299,13 @@ class GmailSyncService:
                     WHERE id = ?
                 """, (latest_history_id, account_id, account_id))
                 await db.commit()
-            # Rebuild contacts accurately from emails
+
+            # Rebuild contacts: use fast incremental calculation for deltas, fallback to full rebuild for initial sync
             from app.services.stats_service import StatsService
-            await StatsService.rebuild_contacts(account_id)
+            if not full_sync and existing_ids and all_saved_ids:
+                await StatsService.update_contacts_incremental(account_id, all_saved_ids)
+            else:
+                await StatsService.rebuild_contacts(account_id)
 
             # Query actual final count in DB
             async with get_db() as db:

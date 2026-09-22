@@ -1,6 +1,32 @@
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from app.database import get_db
+from app.services.trade_terms import expand_trade_keywords
+
+def extract_keyword_window(text: str, keywords: List[str], window_size: int = 500) -> str:
+    """Extracts a sliding text window centered around the first matching keyword instead of arbitrary prefix."""
+    if not text:
+        return ""
+    clean = text.strip().replace("\r", " ").replace("\n", " ")
+    if len(clean) <= window_size:
+        return clean
+    lower_text = clean.lower()
+    best_pos = -1
+    for kw in keywords:
+        if not kw or len(kw) < 2:
+            continue
+        pos = lower_text.find(kw.lower())
+        if pos != -1 and (best_pos == -1 or pos < best_pos):
+            best_pos = pos
+    if best_pos == -1:
+        return clean[:window_size] + "..."
+    lead_in = min(int(window_size * 0.2), 60)
+    start = max(0, best_pos - lead_in)
+    end = min(len(clean), start + window_size)
+    snip = clean[start:end].strip()
+    prefix = "... " if start > 0 else ""
+    suffix = " ..." if end < len(clean) else ""
+    return prefix + snip + suffix
 
 def extract_emails(text: str) -> List[str]:
     """Extracts email addresses from text"""
@@ -45,10 +71,11 @@ async def detect_query_intent(query: str, extracted_emails: List[str]) -> Dict[s
 async def search_context_for_query(
     query: str, 
     account_id: Optional[str] = None,
-    history: Optional[List[Dict[str, Any]]] = None
+    history: Optional[List[Dict[str, Any]]] = None,
+    allowed_account_ids: Optional[List[str]] = None
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    High-precision hybrid retrieval:
+    High-precision hybrid retrieval with strict RBAC account isolation:
     1. Entity Extraction: extract emails & match contact names (with multi-turn context support)
     2. Targeted Bi-directional Email & Contact Retrieval: query both inbound & outbound emails directly
     3. Financial & Subscriptions context if intent detected
@@ -82,8 +109,18 @@ async def search_context_for_query(
     existing_ref_ids = set()
 
     async with get_db() as db:
-        acc_filter = "account_id = ? AND " if account_id else ""
-        acc_params = [account_id] if account_id else []
+        if account_id:
+            acc_filter = "account_id = ? AND "
+            acc_params = [account_id]
+        elif allowed_account_ids is not None:
+            if not allowed_account_ids:
+                return "（当前用户未被分配任何邮箱权限）", []
+            placeholders = ",".join("?" for _ in allowed_account_ids)
+            acc_filter = f"account_id IN ({placeholders}) AND "
+            acc_params = list(allowed_account_ids)
+        else:
+            acc_filter = ""
+            acc_params = []
 
         # ---------------------------------------------------------
         # 1. Targeted Entity & Contact Search (Priority 1)
@@ -272,10 +309,17 @@ async def search_context_for_query(
                 "谢谢", "可以", "是否", "通知", "谁是", "哪个", "发过", "收过", "发信", "收信"
             }
             search_words = [t for t in raw_tokens if t.lower() not in stopwords and len(t) >= 2]
+            expanded_en = expand_trade_keywords(search_words + [clean_q])
+
+            all_fts_tokens = list(search_words[:4])
+            for en_term in expanded_en:
+                clean_en = en_term.replace('"', '').strip()
+                if clean_en and clean_en.lower() not in [x.lower() for x in all_fts_tokens]:
+                    all_fts_tokens.append(clean_en)
 
             matched_emails = []
-            if search_words:
-                fts_query = " OR ".join(f'"{w}"' for w in search_words[:5])
+            if all_fts_tokens:
+                fts_query = " OR ".join(f'"{w}"' for w in all_fts_tokens[:8])
                 try:
                     if account_id:
                         cursor = await db.execute("""
@@ -285,6 +329,18 @@ async def search_context_for_query(
                             WHERE f.account_id = ? AND email_fts MATCH ?
                             LIMIT 8
                         """, (account_id, fts_query))
+                    elif allowed_account_ids is not None:
+                        if not allowed_account_ids:
+                            cursor = None
+                        else:
+                            placeholders = ",".join("?" for _ in allowed_account_ids)
+                            cursor = await db.execute(f"""
+                                SELECT e.id, e.subject, e.from_name, e.from_email, e.to_emails, e.date_str, e.snippet, e.body_text
+                                FROM email_fts f
+                                JOIN emails e ON f.id = e.id
+                                WHERE f.account_id IN ({placeholders}) AND email_fts MATCH ?
+                                LIMIT 8
+                            """, list(allowed_account_ids) + [fts_query])
                     else:
                         cursor = await db.execute("""
                             SELECT e.id, e.subject, e.from_name, e.from_email, e.to_emails, e.date_str, e.snippet, e.body_text
@@ -293,32 +349,37 @@ async def search_context_for_query(
                             WHERE email_fts MATCH ?
                             LIMIT 8
                         """, (fts_query,))
-                    matched_emails = await cursor.fetchall()
+                    matched_emails = await cursor.fetchall() if cursor else []
                 except Exception:
                     matched_emails = []
 
             # Fallback LIKE search if FTS yields few results
-            if len(matched_emails) < 2 and search_words:
-                keywords = search_words[:2]
+            candidate_keywords = search_words[:2] + expanded_en[:3]
+            if len(matched_emails) < 2 and candidate_keywords:
                 like_conditions = []
                 params = []
-                for kw in keywords:
+                for kw in candidate_keywords:
                     like_conditions.append("(subject LIKE ? OR snippet LIKE ? OR from_name LIKE ? OR from_email LIKE ? OR to_emails LIKE ?)")
                     params.extend([f"%{kw}%"] * 5)
                 like_clause = " OR ".join(like_conditions)
 
+                first_kw = candidate_keywords[0]
                 cursor = await db.execute(f"""
                     SELECT id, subject, from_name, from_email, to_emails, date_str, snippet, body_text
                     FROM emails
                     WHERE {acc_filter} ({like_clause})
-                    ORDER BY date_timestamp DESC LIMIT 6
-                """, acc_params + params)
+                    ORDER BY 
+                        CASE WHEN lower(subject) LIKE lower(?) THEN 3 ELSE 1 END DESC,
+                        date_timestamp DESC 
+                    LIMIT 6
+                """, acc_params + params + [f"%{first_kw}%"])
                 fallback_emails = await cursor.fetchall()
                 for f_mail in fallback_emails:
                     if f_mail["id"] not in existing_ref_ids and f_mail["id"] not in [m["id"] for m in matched_emails]:
                         matched_emails.append(f_mail)
 
             if matched_emails:
+                all_snippet_kws = search_words + expanded_en
                 general_lines = ["【关键词相关邮件检索结果】:"]
                 for m in matched_emails:
                     if m["id"] in existing_ref_ids:
@@ -331,9 +392,7 @@ async def search_context_for_query(
                         "date": m["date_str"] or ""
                     }
                     referenced_emails.append(ref_info)
-                    body_sample = (m["body_text"] or m["snippet"] or "").strip().replace("\r", " ").replace("\n", " ")
-                    if len(body_sample) > 400:
-                        body_sample = body_sample[:400] + "..."
+                    body_sample = extract_keyword_window(m["body_text"] or m["snippet"] or "", all_snippet_kws, window_size=500)
                     general_lines.append(
                         f"- [REF:{m['id']}|{m['subject'] or '(无主题)'}|{m['date_str']}]\n"
                         f"  发件人: {ref_info['from']} | 收件人: {m['to_emails'] if ('to_emails' in m.keys()) else ''} | 日期: {m['date_str']}\n"

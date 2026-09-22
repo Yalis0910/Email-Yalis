@@ -121,9 +121,16 @@ export default function Navbar({
                 className="flex items-center space-x-2 sm:space-x-2.5 cursor-pointer group select-none"
                 onClick={() => setActiveTab('dashboard')}
               >
-                <div className="w-2.5 h-2.5 rounded-full bg-[var(--color-accent)] ring-4 ring-[var(--color-accent-soft)] transition-transform group-hover:scale-125" />
+                <img 
+                  src="/ai-avatar.png" 
+                  alt="Email-Yalis Logo" 
+                  className="w-6 h-6 rounded-full object-cover ring-2 ring-[var(--color-accent-soft)] transition-transform group-hover:scale-110 shadow-2xs shrink-0" 
+                />
                 <span className="text-base sm:text-lg font-serif font-medium tracking-tight text-[var(--color-neutral-10)]">
                   Email-Yalis
+                </span>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[var(--color-neutral-6)] leading-none transition-colors group-hover:border-[var(--color-accent-border)] group-hover:text-[var(--color-accent)] shrink-0">
+                  v1.0.0
                 </span>
               </div>
             </div>
@@ -322,9 +329,16 @@ export default function Navbar({
               setMobileMenuOpen(false);
             }}
           >
-            <div className="w-2.5 h-2.5 rounded-full bg-[var(--color-accent)] ring-4 ring-[var(--color-accent-soft)]" />
+            <img 
+              src="/ai-avatar.png" 
+              alt="Email-Yalis Logo" 
+              className="w-5 h-5 rounded-full object-cover ring-2 ring-[var(--color-accent-soft)] shrink-0" 
+            />
             <span className="font-serif font-medium tracking-tight text-base text-[var(--color-neutral-10)]">
               Email-Yalis
+            </span>
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[var(--color-neutral-6)] leading-none shrink-0">
+              v1.0.0
             </span>
           </div>
           <button

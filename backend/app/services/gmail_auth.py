@@ -86,6 +86,20 @@ class GmailAuthService:
 
         account_id = f"acc_{email_address.lower()}"
 
+        # Cache avatar locally if picture URL exists
+        if avatar_url and avatar_url.startswith("http"):
+            try:
+                import urllib.request
+                from app.config import AVATARS_DIR
+                req = urllib.request.Request(avatar_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    img_data = resp.read()
+                    if img_data:
+                        ext = ".png" if img_data.startswith(b'\x89PNG') else ".jpg"
+                        (AVATARS_DIR / f"{account_id}{ext}").write_bytes(img_data)
+            except Exception:
+                pass
+
         async with get_db() as db:
             await db.execute("""
                 INSERT INTO accounts (

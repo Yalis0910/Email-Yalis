@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Search, 
   Paperclip, 
@@ -7,7 +7,10 @@ import {
   FileText, 
   ExternalLink,
   Eye,
-  Download
+  Download,
+  Calendar,
+  ChevronDown,
+  X
 } from 'lucide-react';
 import { api } from '../api/client';
 import AttachmentPreviewModal from '../components/AttachmentPreviewModal';
@@ -20,8 +23,16 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
   const [emails, setEmails] = useState([]);
   const [selectedEmail, setSelectedEmail] = useState(null);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [folder, setFolder] = useState('ALL'); // 'ALL' | 'INBOX' | 'SENT'
   const [onlyAttachments, setOnlyAttachments] = useState(false);
+  const [dateRange, setDateRange] = useState('all'); // 'all' | '7d' | '30d' | '90d' | '365d' | 'custom'
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [tempStartDate, setTempStartDate] = useState('');
+  const [tempEndDate, setTempEndDate] = useState('');
+  const [showCustomDatePopover, setShowCustomDatePopover] = useState(false);
+  const dateDropdownRef = useRef(null);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -29,9 +40,29 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
   const [viewMode, setViewMode] = useState('html'); // 'html' | 'text'
   const [previewAttachment, setPreviewAttachment] = useState(null);
 
+  // Click outside to close custom date popover
+  useEffect(() => {
+    if (!showCustomDatePopover) return;
+    const handleClickOutside = (e) => {
+      if (dateDropdownRef.current && !dateDropdownRef.current.contains(e.target)) {
+        setShowCustomDatePopover(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showCustomDatePopover]);
+
+  // 300ms debounce for search query to avoid frequent full-table scans
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+
   useEffect(() => {
     loadEmails();
-  }, [selectedAccount, search, folder, onlyAttachments, page]);
+  }, [selectedAccount, debouncedSearch, folder, onlyAttachments, dateRange, startDate, endDate, page]);
 
   useEffect(() => {
     const id = typeof initialEmailId === 'object' ? initialEmailId?.id : initialEmailId;
@@ -46,9 +77,12 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
       setLoading(true);
       const res = await api.getEmails({
         account_id: selectedAccount || '',
-        q: search,
+        q: debouncedSearch,
         folder: folder !== 'ALL' ? folder : undefined,
         has_attachments: onlyAttachments ? 1 : undefined,
+        date_range: dateRange !== 'all' ? dateRange : undefined,
+        start_date: (dateRange === 'custom' && startDate) ? startDate : undefined,
+        end_date: (dateRange === 'custom' && endDate) ? endDate : undefined,
         page,
         limit: 25
       });
@@ -130,6 +164,10 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
     }
   };
 
+  const safeHtml = useMemo(() => {
+    return getSafeHtml(selectedEmail?.body_html);
+  }, [selectedEmail?.id, selectedEmail?.body_html]);
+
   const openInNewTab = () => {
     if (!selectedEmail) return;
     const content = selectedEmail.body_html || `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${selectedEmail.subject || '邮件'}</title><style>body{padding:24px;font-family:monospace;white-space:pre-wrap;}</style></head><body>${selectedEmail.body_text || selectedEmail.snippet || ''}</body></html>`;
@@ -141,7 +179,7 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
   return (
     <div className="space-y-4 pb-16">
       {/* Top Search Filter Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[var(--color-border)] pb-3 pt-2">
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 border-b border-[var(--color-border)] pb-3 pt-2">
         <div className="relative flex-1 max-w-md">
           <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-neutral-5)]" />
           <input
@@ -153,7 +191,7 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
           />
         </div>
 
-        <div className="flex items-center space-x-3 text-xs font-mono text-[var(--color-neutral-6)]">
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 text-xs font-mono text-[var(--color-neutral-6)]">
           {/* Folder Filter Tabs */}
           <div className="inline-flex p-0.5 rounded-md bg-[var(--color-surface-subtle)] border border-[var(--color-border)]">
             {[
@@ -173,6 +211,133 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
                 {f.label}
               </button>
             ))}
+          </div>
+
+          {/* Date Range Filter Group */}
+          <div className="relative" ref={dateDropdownRef}>
+            <div className="inline-flex p-0.5 rounded-md bg-[var(--color-surface-subtle)] border border-[var(--color-border)]">
+              {[
+                { id: 'all', label: '全部时间' },
+                { id: '7d', label: '近7天' },
+                { id: '30d', label: '近30天' },
+                { id: '90d', label: '近90天' },
+                { id: '365d', label: '近1年' },
+              ].map((d) => (
+                <button
+                  key={d.id}
+                  onClick={() => {
+                    setDateRange(d.id);
+                    setStartDate('');
+                    setEndDate('');
+                    setShowCustomDatePopover(false);
+                    setPage(1);
+                  }}
+                  className={`px-2 py-1 rounded transition-all ${
+                    dateRange === d.id
+                      ? 'bg-[var(--color-surface)] text-[var(--color-neutral-10)] shadow-xs font-medium'
+                      : 'text-[var(--color-neutral-6)] hover:text-[var(--color-neutral-9)]'
+                  }`}
+                >
+                  {d.label}
+                </button>
+              ))}
+
+              <button
+                onClick={() => {
+                  setTempStartDate(startDate);
+                  setTempEndDate(endDate);
+                  setShowCustomDatePopover(!showCustomDatePopover);
+                }}
+                className={`flex items-center gap-1 px-2 py-1 rounded transition-all ${
+                  dateRange === 'custom'
+                    ? 'bg-[var(--color-surface)] text-[var(--color-accent)] shadow-xs font-medium'
+                    : 'text-[var(--color-neutral-6)] hover:text-[var(--color-neutral-9)]'
+                }`}
+                title="自定义日期区间"
+              >
+                <Calendar className="w-3 h-3" />
+                <span>
+                  {dateRange === 'custom' && (startDate || endDate)
+                    ? `${startDate || '起始'} ~ ${endDate || '至今'}`
+                    : '自定义'}
+                </span>
+                <ChevronDown className="w-3 h-3 opacity-60" />
+              </button>
+            </div>
+
+            {/* Custom Date Popover */}
+            {showCustomDatePopover && (
+              <div className="absolute right-0 top-full mt-1.5 z-50 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 w-64 animate-in fade-in zoom-in-95 duration-100">
+                <div className="flex items-center justify-between pb-2 mb-2.5 border-b border-[var(--color-border)]">
+                  <span className="text-xs font-medium text-[var(--color-neutral-9)] flex items-center gap-1.5">
+                    <Calendar className="w-3.5 h-3.5 text-[var(--color-accent)]" />
+                    自定义起止日期
+                  </span>
+                  <button
+                    onClick={() => setShowCustomDatePopover(false)}
+                    className="text-[var(--color-neutral-5)] hover:text-[var(--color-neutral-9)]"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div className="space-y-2 text-xs">
+                  <div>
+                    <label className="block text-[11px] text-[var(--color-neutral-6)] mb-1">开始日期</label>
+                    <input
+                      type="date"
+                      value={tempStartDate}
+                      onChange={(e) => setTempStartDate(e.target.value)}
+                      className="w-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] rounded px-2 py-1 text-xs text-[var(--color-neutral-9)] outline-none focus:border-[var(--color-accent)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-[var(--color-neutral-6)] mb-1">结束日期</label>
+                    <input
+                      type="date"
+                      value={tempEndDate}
+                      onChange={(e) => setTempEndDate(e.target.value)}
+                      className="w-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] rounded px-2 py-1 text-xs text-[var(--color-neutral-9)] outline-none focus:border-[var(--color-accent)]"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 mt-2 border-t border-[var(--color-border)]">
+                    <button
+                      onClick={() => {
+                        setTempStartDate('');
+                        setTempEndDate('');
+                        setStartDate('');
+                        setEndDate('');
+                        setDateRange('all');
+                        setShowCustomDatePopover(false);
+                        setPage(1);
+                      }}
+                      className="text-[11px] text-[var(--color-neutral-5)] hover:text-[var(--color-neutral-8)] transition-colors"
+                    >
+                      重置全部
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (!tempStartDate && !tempEndDate) {
+                          setDateRange('all');
+                          setStartDate('');
+                          setEndDate('');
+                        } else {
+                          setDateRange('custom');
+                          setStartDate(tempStartDate);
+                          setEndDate(tempEndDate);
+                        }
+                        setShowCustomDatePopover(false);
+                        setPage(1);
+                      }}
+                      className="px-2.5 py-1 rounded bg-[var(--color-accent)] text-white text-[11px] font-medium hover:bg-[var(--color-accent)]/90 transition-colors shadow-xs"
+                    >
+                      应用筛选
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           <label className="flex items-center space-x-1.5 cursor-pointer select-none">
@@ -445,7 +610,7 @@ export default function MailSearch({ selectedAccount, initialEmailId }) {
                 {viewMode === 'html' && selectedEmail.body_html ? (
                   <iframe
                     title="email-preview"
-                    srcDoc={getSafeHtml(selectedEmail.body_html)}
+                    srcDoc={safeHtml}
                     className="w-full h-full border border-[var(--color-border)] rounded-lg bg-white shadow-xs"
                     sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                   />

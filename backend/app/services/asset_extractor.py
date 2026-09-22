@@ -111,8 +111,16 @@ BILLING_KEYWORDS = [
     "付款凭证", "支付成功", "订阅确认", "扣费提醒", "续费通知"
 ]
 
-# Regex for currency & amount
-AMOUNT_REGEX = re.compile(r'(?:[\$￥€£]|USD|EUR|GBP|CNY|RMB)\s*([0-9]+(?:\.[0-9]{2})?)', re.IGNORECASE)
+# Regex for currency & amount with direct symbol binding
+AMOUNT_PREFIX_REGEX = re.compile(r'([\$￥€£]|USD|EUR|GBP|CNY|RMB)\s*([0-9]+(?:\.[0-9]{1,2})?)', re.IGNORECASE)
+AMOUNT_POSTFIX_REGEX = re.compile(r'([0-9]+(?:\.[0-9]{1,2})?)\s*(USD|EUR|GBP|CNY|RMB|元)', re.IGNORECASE)
+
+CURRENCY_MAP = {
+    "$": "USD", "usd": "USD",
+    "€": "EUR", "eur": "EUR",
+    "£": "GBP", "gbp": "GBP",
+    "￥": "CNY", "cny": "CNY", "rmb": "CNY", "元": "CNY"
+}
 CYCLE_MONTH_REGEX = re.compile(r'(monthly|per month|\/mo|/month|按月|每月)', re.IGNORECASE)
 CYCLE_YEAR_REGEX = re.compile(r'(annually|yearly|per year|\/yr|/year|按年|每年)', re.IGNORECASE)
 
@@ -164,21 +172,26 @@ class AssetExtractor:
         platform_info = cls.identify_platform(from_email, from_name, subject)
         service_name = platform_info[0] if platform_info else (from_name or cls.extract_domain(from_email))
 
-        # Extract amount
-        match = AMOUNT_REGEX.search(content_to_scan)
+        # Extract amount and currency accurately by bound token
         amount = 0.0
         currency = "USD"
-        if match:
+        match_prefix = AMOUNT_PREFIX_REGEX.search(content_to_scan)
+        if match_prefix:
             try:
-                amount = float(match.group(1))
+                amount = float(match_prefix.group(2))
+                sym = match_prefix.group(1).lower()
+                currency = CURRENCY_MAP.get(sym, "USD")
             except ValueError:
                 amount = 0.0
-        if "￥" in content_to_scan or "cny" in content_to_scan or "rmb" in content_to_scan:
-            currency = "CNY"
-        elif "€" in content_to_scan or "eur" in content_to_scan:
-            currency = "EUR"
-        elif "£" in content_to_scan or "gbp" in content_to_scan:
-            currency = "GBP"
+        else:
+            match_postfix = AMOUNT_POSTFIX_REGEX.search(content_to_scan)
+            if match_postfix:
+                try:
+                    amount = float(match_postfix.group(1))
+                    sym = match_postfix.group(2).lower()
+                    currency = CURRENCY_MAP.get(sym, "USD")
+                except ValueError:
+                    amount = 0.0
 
         # Detect cycle
         cycle = "one_time"

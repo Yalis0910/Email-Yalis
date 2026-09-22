@@ -1,10 +1,12 @@
 import json
 import base64
-from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File
+import asyncio
+import urllib.request
+from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Response
 from fastapi.responses import HTMLResponse
 from typing import Optional, Dict, Any, List
 
-from app.config import CREDENTIALS_FILE, DATA_DIR, OAUTH_REDIRECT_URI
+from app.config import CREDENTIALS_FILE, DATA_DIR, AVATARS_DIR, OAUTH_REDIRECT_URI
 from app.database import get_db
 from app.schemas import AccountOut
 from app.services.imap_sync import GenericImapService, PROVIDER_DEFAULTS
@@ -269,6 +271,12 @@ async def connect_imap(
         raise HTTPException(status_code=400, detail=f"连接失败: {err_msg}")
 
 
+def _format_acc(row_dict: dict) -> dict:
+    if row_dict.get("avatar_url"):
+        row_dict["avatar_url"] = f"/api/auth/accounts/{row_dict['id']}/avatar"
+    return row_dict
+
+
 @router.get("/accounts", response_model=List[AccountOut])
 async def list_accounts(current_user: Dict[str, Any] = Depends(get_current_user)):
     authorized = get_authorized_account_ids(current_user)
@@ -277,7 +285,7 @@ async def list_accounts(current_user: Dict[str, Any] = Depends(get_current_user)
             # Superadmin: all accounts
             async with db.execute("SELECT * FROM accounts ORDER BY created_at DESC") as c:
                 rows = await c.fetchall()
-                return [dict(r) for r in rows]
+                return [_format_acc(dict(r)) for r in rows]
         else:
             if not authorized:
                 return []
@@ -287,7 +295,86 @@ async def list_accounts(current_user: Dict[str, Any] = Depends(get_current_user)
                 list(authorized)
             ) as c:
                 rows = await c.fetchall()
-                return [dict(r) for r in rows]
+                return [_format_acc(dict(r)) for r in rows]
+
+
+@router.get("/accounts/{account_id}/avatar")
+async def get_account_avatar(account_id: str):
+    """
+    Get account avatar with local caching and proxying to prevent cross-origin/GFW issues.
+    Falls back to dynamically generated SVG avatar if image cannot be loaded.
+    """
+    # 1. Check local cache (.png, .jpg, .webp)
+    for ext, media_type in [(".png", "image/png"), (".jpg", "image/jpeg"), (".webp", "image/webp")]:
+        file_path = AVATARS_DIR / f"{account_id}{ext}"
+        if file_path.exists() and file_path.stat().st_size > 0:
+            return Response(
+                content=file_path.read_bytes(),
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=86400"}
+            )
+
+    # 2. Query account info from DB
+    avatar_url = None
+    display_name = ""
+    email = ""
+    async with get_db() as db:
+        async with db.execute("SELECT email, display_name, avatar_url FROM accounts WHERE id = ?", (account_id,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                email = row["email"] or ""
+                display_name = row["display_name"] or ""
+                avatar_url = row["avatar_url"]
+
+    # 3. If avatar_url is remote, try to download and cache it
+    if avatar_url and avatar_url.startswith("http"):
+        try:
+            req = urllib.request.Request(
+                avatar_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )
+            loop = asyncio.get_event_loop()
+            def _fetch():
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.read()
+            data = await loop.run_in_executor(None, _fetch)
+            if data:
+                media_type = "image/png" if data.startswith(b'\x89PNG') else "image/jpeg"
+                ext = ".png" if media_type == "image/png" else ".jpg"
+                save_path = AVATARS_DIR / f"{account_id}{ext}"
+                save_path.write_bytes(data)
+                return Response(
+                    content=data,
+                    media_type=media_type,
+                    headers={"Cache-Control": "public, max-age=86400"}
+                )
+        except Exception:
+            pass
+
+    # 4. Fallback: generate a clean SVG avatar with the account initial
+    initial = (display_name or email or "?")[:1].upper()
+    palette = [
+        ("#4F46E5", "#818CF8"),
+        ("#0D9488", "#2DD4BF"),
+        ("#D97706", "#FBBF24"),
+        ("#E11D48", "#FB7185"),
+        ("#7C3AED", "#A78BFA"),
+        ("#2563EB", "#60A5FA"),
+        ("#059669", "#34D399"),
+    ]
+    color_idx = sum(ord(c) for c in email) % len(palette) if email else 0
+    c1, c2 = palette[color_idx]
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">'
+        f'<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+        f'<stop offset="0%" stop-color="{c1}"/><stop offset="100%" stop-color="{c2}"/>'
+        f'</linearGradient></defs>'
+        f'<rect width="96" height="96" rx="48" fill="url(#g)"/>'
+        f'<text x="50%" y="54%" font-family="system-ui, -apple-system, sans-serif" '
+        f'font-size="40" font-weight="600" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">{initial}</text>'
+        f'</svg>'
+    )
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
 
 @router.post("/accounts/{account_id}/clear_emails")
 async def clear_account_emails(
@@ -320,6 +407,7 @@ async def clear_account_emails(
         await db.execute("DELETE FROM email_ai_insights WHERE account_id = ?", (account_id,))
         await db.execute("DELETE FROM attachments WHERE account_id = ?", (account_id,))
         await db.execute("DELETE FROM emails WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM email_fts WHERE account_id = ?", (account_id,))
 
         # Reset account statistics and progress
         await db.execute("""
@@ -389,6 +477,7 @@ async def delete_account(
         await db.execute("DELETE FROM user_account_permissions WHERE account_id = ?", (account_id,))
         await db.execute("DELETE FROM group_account_permissions WHERE account_id = ?", (account_id,))
         await db.execute("DELETE FROM emails WHERE account_id = ?", (account_id,))
+        await db.execute("DELETE FROM email_fts WHERE account_id = ?", (account_id,))
         await db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         await db.commit()
 

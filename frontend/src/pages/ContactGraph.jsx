@@ -67,8 +67,17 @@ export default function ContactGraph({
   const [loadingMore, setLoadingMore] = useState(false);
   const [contactLoading, setContactLoading] = useState(false);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [sortBy, setSortBy] = useState('weight'); // 'weight' | 'recent'
   const [selectedTier, setSelectedTier] = useState('all'); // 'all' | 'A' | 'B' | 'C' | 'overdue'
+
+  // 300ms debounce for contacts search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   // Timeline Drawer State
   const [selectedContactForTimeline, setSelectedContactForTimeline] = useState(null);
@@ -148,7 +157,7 @@ export default function ContactGraph({
       }
       const res = await api.getContacts({
         account_id: selectedAccount || '',
-        search: search.trim() || undefined,
+        search: debouncedSearch.trim() || undefined,
         sort_by: sortBy,
         tier: selectedTier !== 'all' ? selectedTier : undefined,
         page: targetPage,
@@ -170,7 +179,7 @@ export default function ContactGraph({
       setContactLoading(false);
       setLoadingMore(false);
     }
-  }, [selectedAccount, search, sortBy, selectedTier]);
+  }, [selectedAccount, debouncedSearch, sortBy, selectedTier]);
 
   const loadTierStats = useCallback(async () => {
     setIsStatsLoading(true);

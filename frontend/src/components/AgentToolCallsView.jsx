@@ -1,22 +1,28 @@
 import React, { useState } from 'react';
-import { Wrench, ChevronDown, ChevronRight, CheckCircle2, Loader2, Database, Mail, User, CreditCard, Paperclip, Globe } from 'lucide-react';
+import { Wrench, ChevronDown, ChevronRight, CheckCircle2, Loader2, Database, Mail, User, CreditCard, Paperclip, Globe, FileText, Award, BookOpen } from 'lucide-react';
 
 const TOOL_ICONS = {
   search_emails: Mail,
+  read_email_detail: FileText,
   get_contact_info: User,
   query_subscriptions: CreditCard,
   query_digital_assets: Database,
   inspect_attachment: Paperclip,
-  search_web: Globe
+  search_web: Globe,
+  query_customer_tier: Award,
+  search_sales_playbook: BookOpen
 };
 
 const TOOL_NAMES = {
   search_emails: '检索往来邮件',
+  read_email_detail: '读取邮件正文详情',
   get_contact_info: '查询联系人档案',
   query_subscriptions: '查询财务与订阅',
   query_digital_assets: '查询数字资产平台',
   inspect_attachment: '解析附件内容',
-  search_web: '互联网外部检索'
+  search_web: '互联网外部检索',
+  query_customer_tier: '查询客户评级',
+  search_sales_playbook: '检索外贸对策库'
 };
 
 export default function AgentToolCallsView({ toolCalls = [] }) {

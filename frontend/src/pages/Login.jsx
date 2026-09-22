@@ -48,10 +48,17 @@ export default function Login() {
       <div className="w-full max-w-md relative z-10 animate-in fade-in zoom-in-95 duration-300">
         {/* Brand Header */}
         <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center space-x-3">
-            <div className="w-3.5 h-3.5 rounded-full bg-[var(--color-accent)] ring-4 ring-[var(--color-accent-soft)]" />
+          <div className="inline-flex items-center justify-center space-x-2.5">
+            <img 
+              src="/ai-avatar.png" 
+              alt="Email-Yalis Logo" 
+              className="w-8 h-8 rounded-full object-cover ring-2 ring-[var(--color-accent-soft)] shadow-xs shrink-0" 
+            />
             <span className="text-2xl font-serif font-medium tracking-tight text-[var(--color-neutral-10)]">
               Email-Yalis
+            </span>
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[var(--color-surface-subtle)] border border-[var(--color-border)] text-[var(--color-neutral-6)] leading-none select-none">
+              v1.0.0
             </span>
           </div>
         </div>

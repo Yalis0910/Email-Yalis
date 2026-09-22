@@ -8,6 +8,18 @@ from app.database import get_db
 from app.services.ai_retrieval import search_context_for_query
 from app.services.ai_tools import COPILOT_TOOLS, execute_copilot_tool
 
+TOOL_NAMES = {
+    "search_emails": "检索往来邮件",
+    "read_email_detail": "读取邮件正文详情",
+    "inspect_attachment": "深度解析附件内容",
+    "get_contact_info": "查询联系人画像档案",
+    "query_subscriptions": "查询财务与订阅台账",
+    "query_digital_assets": "查询数字资产平台",
+    "search_web": "互联网公开信息检索",
+    "query_customer_tier": "查询客户商业评级",
+    "search_sales_playbook": "检索外贸对策话术库"
+}
+
 DEFAULT_AI_SETTINGS = {
     "ai_provider": "deepseek",
     "ai_base_url": "https://api.deepseek.com/v1",
@@ -527,7 +539,7 @@ class AIService:
 
         is_local = "localhost" in base_url or "127.0.0.1" in base_url
         if not api_key and not is_local:
-            err_msg = "请先在「系统设置」中配置大模型 API Key（支持 DeepSeek、OpenAI、SiliconFlow 或 本地 Ollama）"
+            err_msg = "请先在「系统设置」中配置大模型 API Key（支持 DeepSeek 或 自定义接口）"
             yield f"data: {json.dumps({'type': 'error', 'error': err_msg}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -1358,7 +1370,7 @@ class AIService:
         is_local = "localhost" in base_url or "127.0.0.1" in base_url
 
         if not api_key and not is_local:
-            err_msg = "请先在「系统设置」中配置大模型 API Key（支持 DeepSeek、OpenAI、SiliconFlow 或 本地 Ollama）"
+            err_msg = "请先在「系统设置」中配置大模型 API Key（支持 DeepSeek 或 自定义接口）"
             yield f"data: {json.dumps({'type': 'error', 'error': err_msg}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -1374,11 +1386,14 @@ class AIService:
         # System prompt for Agent
         agent_system_prompt = """你是由 Email-Yalis 驱动的专业邮件与人脉数字资产分析专家。
 你具备调用本地工具直接查询 SQLite 数据库、深度解析附件及通过互联网外部检索的能力，拥有以下工具：
-- `search_emails`：根据关键词、发件人、收件人或联系人邮箱精准检索邮件（支持双向收发信穿透）。返回的每封邮件包含关联附件列表（含附件ID与文件名）。
+- `search_emails`：根据关键词、发件人、收件人或联系人邮箱精准检索邮件（支持双向收发信穿透与中英双向业务词自动扩展）。返回的每封邮件包含关联附件列表（含附件ID与文件名）。
+- `read_email_detail`：深入读取指定邮件的完整正文内容、往来收件人列表以及关联附件清单。当 search_emails 检索到了相关邮件，但摘要信息不足以判断完整商务条款、还价金额、具体单价或交期协议时，必须调用此工具深入阅读邮件全文。
 - `inspect_attachment`：深入解析具体附件的完整内容（支持 PDF 合同/发票/报价单、Excel 电子表格、CSV/纯文本数据以及图像规格）。当用户询问附件详情（如订单金额、单价、款项明细、数据行等）时必须调用此工具。
 - `get_contact_info`：根据邮箱或姓名查询联系人档案画像、往来统计与历史生成的 AI 报告。
 - `query_subscriptions`：查询 SaaS 订阅账单与周期性财务开销。
 - `query_digital_assets`：查询已登记的数字资产与第三方平台账号。
+- `query_customer_tier`：查询客户的商业分级（A/B/C/D级）、商机推进阶段、预估订单金额与评级原因。
+- `search_sales_playbook`：从外贸销售对策库中检索应对客户异议（如价格偏高、要求折扣、交期延误、账期付款等）的高转化战术与回复范式。
 - `search_web`：通过互联网进行外部公开信息检索。当用户询问外部事实、公司/服务商背景介绍、最新资讯、汇率换算、技术文档或需要对发件人域名/外部平台进行网络调研时调用此工具。
 
 【工作准则】：
@@ -1386,9 +1401,9 @@ class AIService:
 2. 【多轮对话与指代消解】：当用户提问包含指代性代词（如“这名客户”、“该订单”、“他的邮箱”、“对方”、“为什么丢单”）时，必须结合前文对话中已提到的客户姓名（如 Kelly Marzo）、邮箱或订单号，将其作为参数传入工具进行定向精准检索，切勿脱离上下文断章取义。
 3. 【业务背景与检索规范】：
    - 本地邮件库以英文外贸往来业务为主（常见如 MaxEmblem 徽章/硬币/布贴/勋章定制，核心业务词包括 order, invoice, payment, sample, PO, quotation, shipment, tracking 等）。
-   - 当用户使用中文询问涉及“订单、客户、成交、发票、合同、报价、物流”等业务时，调用 `search_emails` 的 `keywords` 必须优先结合常见的英文核心词（例如 "order", "invoice", "payment", "sample" 等）或指定联系人邮箱/姓名，切勿只搜索中文词导致检索为空。
-   - 【核心词精简】：`keywords` 请使用 1~2 个精简核心词（如 "order" 或 "invoice"），切勿拼接冗长长难句（如 "order confirmed deal closed"），以确保检索命中率。
-4. 若用户提问涉及附件细节（如发票金额、报价条目、工单明细等），可先通过 `search_emails` 或联系人往来邮件识别附件 ID，再调用 `inspect_attachment` 解析附件内容后再回答。
+   - 当用户使用中文询问涉及“订单、客户、成交、发票、合同、报价、物流”等业务时，系统及工具支持直接输入中文或核心英文词进行双向匹配检索。
+   - 【核心词精简】：调用 search_emails 时 keywords 请使用 1~2 个精简核心词（如 "order" 或 "invoice" 或 "打样"），切勿拼接冗长长难句，以确保检索命中率。
+4. 【长正文与深入核查】：若通过 search_emails 检索到的候选邮件摘要信息较短或涉及具体条款（如还价单价、付款协议、交期约定、详细报价），必须发起调用 `read_email_detail` 深入读取该邮件的完整正文，切勿仅凭截断的摘要凭空脑补。若涉及具体附件细节，再进一步调用 `inspect_attachment` 解析附件。
 5. 遇到涉及外部公司背景、未知 SaaS 平台介绍、最新汇率、行业资讯或用户明确要求联网检索的问题，主动调用 `search_web` 获取准确客观的外部信息。
 6. 若回答依据了具体检索出的邮件或附件所属邮件，必须在陈述句末尾带上引用标记 `[REF:email_id|邮件主题|日期]`，系统前端会自动将其渲染为可点击的邮件卡片。
 7. 排版清晰，善于使用 Markdown 列表、加粗以及表格进行对比展示。
@@ -1530,11 +1545,11 @@ class AIService:
 
                         # 1. Emit tool_start
                         tool_display_name = TOOL_NAMES.get(fn_name, fn_name) if 'TOOL_NAMES' in globals() else fn_name
-                        yield f"data: {json.dumps({'type': 'status', 'stage': 'tool_executing', 'message': f'正在调用工具检索数据（{fn_name}）...'}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'tool_executing', 'message': f'正在调用工具检索数据（{tool_display_name}）...'}, ensure_ascii=False)}\n\n"
                         yield f"data: {json.dumps({'type': 'tool_start', 'id': tc_id, 'tool_name': fn_name, 'args': fn_args}, ensure_ascii=False)}\n\n"
 
                         # 2. Execute local tool
-                        tool_result, refs, summary = await execute_copilot_tool(fn_name, fn_args, account_id)
+                        tool_result, refs, summary = await execute_copilot_tool(fn_name, fn_args, account_id, allowed_account_ids)
                         tool_responses[tc_id] = tool_result
                         for r in refs:
                             if r["id"] not in [x["id"] for x in all_references]:
@@ -1591,7 +1606,7 @@ class AIService:
                                 pass
         except Exception as e:
             # Fallback to pre-retrieval RAG mode if tools calling is unsupported or failed
-            context_str, references = await search_context_for_query(query, account_id, history=active_history)
+            context_str, references = await search_context_for_query(query, account_id, history=active_history, allowed_account_ids=allowed_account_ids)
             all_references = list(references)
             for cr in contact_initial_refs:
                 if not any(x.get("id") == cr.get("id") for x in all_references):

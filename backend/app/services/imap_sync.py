@@ -678,6 +678,8 @@ class GenericImapService:
 
                 processed_count = 0
 
+                all_saved_ids = []
+
                 # If Gmail or single worker: reuse the existing authenticated `mail` connection directly!
                 # This guarantees EXACTLY 1 connection is ever created, fully immune to concurrency leaks.
                 if is_gmail or max_workers == 1:
@@ -687,7 +689,9 @@ class GenericImapService:
                             break
                         fetched_items = fetch_chunk_with_conn(mail, ch, curr_folder_state)
                         if fetched_items:
-                            cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                            saved_ids = cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                            if saved_ids:
+                                all_saved_ids.extend(saved_ids)
                         processed_count += len(ch)
                         curr_val = min(new_msgs_count, processed_count)
                         pct = (curr_val * 100) // new_msgs_count
@@ -740,7 +744,9 @@ class GenericImapService:
                             try:
                                 fetched_items = future.result()
                                 if fetched_items:
-                                    cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                                    saved_ids = cls._save_imap_messages_sync(account_id, fetched_items, email_addr)
+                                    if saved_ids:
+                                        all_saved_ids.extend(saved_ids)
                             except Exception as e:
                                 err_s = str(e).lower()
                                 if "exceeded command or bandwidth limits" in err_s or "too many simultaneous" in err_s:
@@ -767,9 +773,9 @@ class GenericImapService:
                     raise RuntimeError(rate_limit_msg[0] or "Account exceeded command or bandwidth limits")
 
                 if stop_event.is_set():
-                    return total_found, processed_count, False, 0
+                    return total_found, processed_count, False, 0, all_saved_ids
 
-                return total_found, new_msgs_count, has_more_batch, total_pending_all
+                return total_found, new_msgs_count, has_more_batch, total_pending_all, all_saved_ids
 
             finally:
                 # Guaranteed cleanup of ALL opened sockets and connections
@@ -780,7 +786,7 @@ class GenericImapService:
                     worker_pool_conns.clear()
 
         try:
-            total_found, new_count, has_more_batch, total_pending_all = await loop.run_in_executor(None, worker_sync)
+            total_found, new_count, has_more_batch, total_pending_all, all_saved_ids = await loop.run_in_executor(None, worker_sync)
             
             stop_event = get_or_create_stop_event(account_id)
             if stop_event.is_set():
@@ -800,10 +806,14 @@ class GenericImapService:
                 """, (account_id, account_id))
                 await db.commit()
 
-            # Rebuild contacts accurately from emails only if new emails were added
+            # Rebuild contacts accurately: incremental for deltas, full rebuild for initial/full sync
             if new_count > 0:
                 from app.services.stats_service import StatsService
-                await StatsService.rebuild_contacts(account_id)
+                if not full_sync and len(existing_ids) > 0 and all_saved_ids:
+                    await StatsService.update_contacts_incremental(account_id, all_saved_ids)
+                else:
+                    await StatsService.rebuild_contacts(account_id)
+
                 if has_more_batch:
                     remaining_count = max(0, total_pending_all - new_count)
                     completion_msg = f"分批同步完成：本批成功入库 {new_count} 封（剩余约 {remaining_count} 封待同步），系统已安全收工避让风控。可继续同步或由后台定时推进。"
@@ -826,10 +836,11 @@ class GenericImapService:
             await notify_progress(account_id, "error", 0, 0, user_msg)
 
     @classmethod
-    def _save_imap_messages_sync(cls, account_id: str, items: List[Tuple[str, Any, str, bool]], user_email: str = ""):
+    def _save_imap_messages_sync(cls, account_id: str, items: List[Tuple[str, Any, str, bool]], user_email: str = "") -> List[str]:
         if not items:
-            return
+            return []
 
+        saved_msg_ids = []
         user_email_clean = user_email.lower().strip() if user_email else account_id.replace("acc_", "").lower().strip()
         con = sqlite3.connect(DB_PATH, timeout=30.0)
         cur = con.cursor()
@@ -955,6 +966,7 @@ class GenericImapService:
                     to_emails, cc_emails, internal_date, date_str, snippet,
                     body_text, body_html, labels, has_attachments, len(body_text) + len(body_html)
                 ))
+                saved_msg_ids.append(msg_id)
 
                 # 2. Attachments
                 for att in raw_attachments:
@@ -1025,6 +1037,7 @@ class GenericImapService:
                     ))
 
             con.commit()
+            return saved_msg_ids
         finally:
             con.close()
 

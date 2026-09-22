@@ -5,19 +5,20 @@ import urllib.parse
 from typing import Dict, Any, List, Optional, Tuple
 import httpx
 from app.database import get_db
+from app.services.trade_terms import expand_trade_keywords
 
 COPILOT_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search_emails",
-            "description": "在本地邮件库中根据发件人、收件人、关键词或时间范围精准检索邮件。返回结果包含邮件基本信息及关联的附件列表（含附件ID与文件名）。支持双向收发信穿透查询。",
+            "description": "在本地邮件库中根据发件人、收件人、关键词或时间范围精准检索邮件。返回结果包含邮件基本信息、摘要及关联的附件列表（含附件ID与文件名）。支持中英文业务词自动扩展及双向收发信穿透查询。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keywords": {
                         "type": "string",
-                        "description": "搜索关键词（建议使用 1~2 个核心词，如 order, invoice, payment, sample, PO 等）。注意：本地邮件库以英文外贸往来为主，提问涉及订单/成交/客户/款项时优先使用对应的英文核心词检索，切勿拼接冗长复合句。"
+                        "description": "搜索关键词（建议使用 1~2 个核心词，如 order, invoice, payment, sample, PO 等）。支持直接输入中文（如'打样'、'交期'、'划痕'），系统会自动进行双语扩展检索。"
                     },
                     "from_email": {
                         "type": "string",
@@ -37,6 +38,28 @@ COPILOT_TOOLS = [
                         "default": 10
                     }
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_email_detail",
+            "description": "深入读取指定邮件的完整正文内容、往来收件人列表以及关联附件清单。当 search_emails 检索到了相关邮件，但摘要长度有限需要获取完整商务条款、还价细节、具体单价、交期约定或长文本详情时必须调用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "邮件的唯一ID（从 search_emails 的返回列表中获取，如 em_xxx 或类似格式）"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "最大读取的正文字符数，默认 4000 字符，可防止超长邮件超出模型窗口",
+                        "default": 4000
+                    }
+                },
+                "required": ["email_id"]
             }
         }
     },
@@ -400,7 +423,8 @@ async def perform_web_search(query: str, limit: int = 5) -> Tuple[List[Dict[str,
 async def execute_copilot_tool(
     name: str, 
     args: Dict[str, Any], 
-    account_id: Optional[str] = None
+    account_id: Optional[str] = None,
+    allowed_account_ids: Optional[List[str]] = None
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str]:
     """
     Executes a copilot tool directly against the local SQLite database.
@@ -409,9 +433,22 @@ async def execute_copilot_tool(
     """
     referenced_emails = []
 
+    if account_id:
+        if allowed_account_ids is not None and account_id not in allowed_account_ids:
+            return {"error": f"无权访问邮箱账号 {account_id}"}, [], "无访问权限"
+        acc_filter = "account_id = ? AND "
+        acc_params = [account_id]
+    elif allowed_account_ids is not None:
+        if not allowed_account_ids:
+            return {"status": "empty", "message": "当前用户未被分配任何邮箱权限"}, [], "无可用邮箱权限"
+        placeholders = ",".join("?" for _ in allowed_account_ids)
+        acc_filter = f"account_id IN ({placeholders}) AND "
+        acc_params = list(allowed_account_ids)
+    else:
+        acc_filter = ""
+        acc_params = []
+
     async with get_db() as db:
-        acc_filter = "account_id = ? AND " if account_id else ""
-        acc_params = [account_id] if account_id else []
 
         if name == "get_contact_info":
             target = str(args.get("email_or_name", "")).strip()
@@ -480,6 +517,7 @@ async def execute_copilot_tool(
                     base_params.extend([f"%{to_email}%", f"%{to_email}%"])
 
             tokens = [t.strip() for t in re.split(r'[\s,，/、|]+', keywords) if t.strip()] if keywords else []
+            expanded_en = expand_trade_keywords(keywords) if keywords else []
             emails = []
 
             if not tokens:
@@ -500,69 +538,152 @@ async def execute_copilot_tool(
                 cur = await db.execute(query_sql, base_params + [limit])
                 emails = await cur.fetchall()
             else:
-                # Multi-phase search:
-                # Phase 1: Exact phrase match
-                p1_conds = list(base_conditions)
-                if acc_filter:
-                    p1_conds.insert(0, acc_filter[:-5])
-                p1_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
-                where_p1 = "WHERE " + " AND ".join(p1_conds)
-                query_p1 = f"""
-                    SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
-                           date_timestamp, date_str, snippet, body_text
-                    FROM emails
-                    {where_p1}
-                    ORDER BY date_timestamp DESC
-                    LIMIT ?
-                """
-                cur = await db.execute(query_p1, base_params + [f"%{keywords}%", f"%{keywords}%", limit])
-                emails = await cur.fetchall()
+                # Optimized Phase 0: Try high-speed FTS5 inverted index match first
+                fts_tokens = [re.sub(r'["\*\^]', '', t).strip() for t in tokens + expanded_en[:4] if len(t.strip()) >= 2]
+                if fts_tokens:
+                    fts_query = " OR ".join(f'"{t}"' for t in fts_tokens[:8])
+                    try:
+                        fts_conditions = ["email_fts MATCH ?"]
+                        fts_params = [fts_query]
 
-                # Phase 2: If len(tokens) > 1 and exact phrase returned no hits, try ALL tokens (AND)
-                if not emails and len(tokens) > 1:
-                    p2_conds = list(base_conditions)
+                        if account_id:
+                            fts_conditions.append("f.account_id = ?")
+                            fts_params.append(account_id)
+                        elif allowed_account_ids is not None:
+                            if not allowed_account_ids:
+                                fts_conditions.append("1=0")
+                            else:
+                                pl = ",".join("?" * len(allowed_account_ids))
+                                fts_conditions.append(f"f.account_id IN ({pl})")
+                                fts_params.extend(allowed_account_ids)
+
+                        if contact_email:
+                            fts_conditions.append("(lower(e.from_email) LIKE lower(?) OR lower(e.to_emails) LIKE lower(?) OR lower(e.cc_emails) LIKE lower(?))")
+                            fts_params.extend([f"%{contact_email}%", f"%{contact_email}%", f"%{contact_email}%"])
+                        else:
+                            if from_email:
+                                fts_conditions.append("(lower(e.from_email) LIKE lower(?) OR lower(e.from_name) LIKE lower(?))")
+                                fts_params.extend([f"%{from_email}%", f"%{from_email}%"])
+                            if to_email:
+                                fts_conditions.append("(lower(e.to_emails) LIKE lower(?) OR lower(e.cc_emails) LIKE lower(?))")
+                                fts_params.extend([f"%{to_email}%", f"%{to_email}%"])
+
+                        where_fts = "WHERE " + " AND ".join(fts_conditions)
+                        cur = await db.execute(f"""
+                            SELECT e.id, e.account_id, e.subject, e.from_name, e.from_email, e.to_emails, e.cc_emails, 
+                                   e.date_timestamp, e.date_str, e.snippet, e.body_text
+                            FROM email_fts f
+                            JOIN emails e ON f.id = e.id
+                            {where_fts}
+                            ORDER BY e.date_timestamp DESC
+                            LIMIT ?
+                        """, fts_params + [limit])
+                        emails = await cur.fetchall()
+                    except Exception:
+                        emails = []
+
+                # If FTS returns no hits or fails, fallback to multi-phase LIKE scanning
+                if not emails:
+                    # Multi-phase search:
+                    # Phase 1: Exact phrase match (prioritize subject match over snippet match)
+                    p1_conds = list(base_conditions)
                     if acc_filter:
-                        p2_conds.insert(0, acc_filter[:-5])
-                    for _ in tokens:
-                        p2_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
-                    where_p2 = "WHERE " + " AND ".join(p2_conds)
-                    query_p2 = f"""
+                        p1_conds.insert(0, acc_filter[:-5])
+                    p1_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
+                    where_p1 = "WHERE " + " AND ".join(p1_conds)
+                    query_p1 = f"""
                         SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
                                date_timestamp, date_str, snippet, body_text
                         FROM emails
-                        {where_p2}
-                        ORDER BY date_timestamp DESC
+                        {where_p1}
+                        ORDER BY 
+                            CASE WHEN lower(subject) LIKE lower(?) THEN 3 ELSE 1 END DESC,
+                            date_timestamp DESC
                         LIMIT ?
                     """
-                    p2_params = list(base_params)
-                    for t in tokens:
-                        p2_params.extend([f"%{t}%", f"%{t}%"])
-                    p2_params.append(limit)
-                    cur = await db.execute(query_p2, p2_params)
+                    cur = await db.execute(query_p1, base_params + [f"%{keywords}%", f"%{keywords}%", f"%{keywords}%", limit])
                     emails = await cur.fetchall()
 
-                # Phase 3: If still no hits, try ANY token (OR) to cover synonym lists (e.g. 'order confirmed deal closed')
-                if not emails and len(tokens) > 1:
-                    p3_conds = list(base_conditions)
-                    if acc_filter:
-                        p3_conds.insert(0, acc_filter[:-5])
-                    or_sub = " OR ".join(["(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))" for _ in tokens])
-                    p3_conds.append(f"({or_sub})")
-                    where_p3 = "WHERE " + " AND ".join(p3_conds)
-                    query_p3 = f"""
-                        SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
-                               date_timestamp, date_str, snippet, body_text
-                        FROM emails
-                        {where_p3}
-                        ORDER BY date_timestamp DESC
-                        LIMIT ?
-                    """
-                    p3_params = list(base_params)
-                    for t in tokens:
-                        p3_params.extend([f"%{t}%", f"%{t}%"])
-                    p3_params.append(limit)
-                    cur = await db.execute(query_p3, p3_params)
-                    emails = await cur.fetchall()
+                    # Phase 2: If len(tokens) > 1 and exact phrase returned no hits, try ALL tokens (AND)
+                    if not emails and len(tokens) > 1:
+                        p2_conds = list(base_conditions)
+                        if acc_filter:
+                            p2_conds.insert(0, acc_filter[:-5])
+                        for _ in tokens:
+                            p2_conds.append("(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))")
+                        where_p2 = "WHERE " + " AND ".join(p2_conds)
+                        first_token = tokens[0]
+                        query_p2 = f"""
+                            SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                                   date_timestamp, date_str, snippet, body_text
+                            FROM emails
+                            {where_p2}
+                            ORDER BY 
+                                CASE WHEN lower(subject) LIKE lower(?) THEN 3 ELSE 1 END DESC,
+                                date_timestamp DESC
+                            LIMIT ?
+                        """
+                        p2_params = list(base_params)
+                        for t in tokens:
+                            p2_params.extend([f"%{t}%", f"%{t}%"])
+                        p2_params.append(f"%{first_token}%")
+                        p2_params.append(limit)
+                        cur = await db.execute(query_p2, p2_params)
+                        emails = await cur.fetchall()
+
+                    # Phase 3: If still no hits, try ANY token (OR) to cover synonym lists
+                    if not emails and len(tokens) > 1:
+                        p3_conds = list(base_conditions)
+                        if acc_filter:
+                            p3_conds.insert(0, acc_filter[:-5])
+                        or_sub = " OR ".join(["(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))" for _ in tokens])
+                        p3_conds.append(f"({or_sub})")
+                        where_p3 = "WHERE " + " AND ".join(p3_conds)
+                        first_token = tokens[0]
+                        query_p3 = f"""
+                            SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                                   date_timestamp, date_str, snippet, body_text
+                            FROM emails
+                            {where_p3}
+                            ORDER BY 
+                                CASE WHEN lower(subject) LIKE lower(?) THEN 3 ELSE 1 END DESC,
+                                date_timestamp DESC
+                            LIMIT ?
+                        """
+                        p3_params = list(base_params)
+                        for t in tokens:
+                            p3_params.extend([f"%{t}%", f"%{t}%"])
+                        p3_params.append(f"%{first_token}%")
+                        p3_params.append(limit)
+                        cur = await db.execute(query_p3, p3_params)
+                        emails = await cur.fetchall()
+
+                    # Phase 4: Cross-lingual trade term expansion (e.g. searching '打样' matches 'sample', '交期' matches 'lead time')
+                    if not emails and expanded_en:
+                        p4_conds = list(base_conditions)
+                        if acc_filter:
+                            p4_conds.insert(0, acc_filter[:-5])
+                        p4_terms = expanded_en[:6]
+                        or_en = " OR ".join(["(lower(subject) LIKE lower(?) OR lower(snippet) LIKE lower(?))" for _ in p4_terms])
+                        p4_conds.append(f"({or_en})")
+                        where_p4 = "WHERE " + " AND ".join(p4_conds)
+                        query_p4 = f"""
+                            SELECT id, account_id, subject, from_name, from_email, to_emails, cc_emails, 
+                                   date_timestamp, date_str, snippet, body_text
+                            FROM emails
+                            {where_p4}
+                            ORDER BY 
+                                CASE WHEN lower(subject) LIKE lower(?) THEN 3 ELSE 1 END DESC,
+                                date_timestamp DESC
+                            LIMIT ?
+                        """
+                        p4_params = list(base_params)
+                        for en_t in p4_terms:
+                            p4_params.extend([f"%{en_t}%", f"%{en_t}%"])
+                        p4_params.append(f"%{p4_terms[0]}%")
+                        p4_params.append(limit)
+                        cur = await db.execute(query_p4, p4_params)
+                        emails = await cur.fetchall()
 
             email_ids = [m["id"] for m in emails]
             email_attachments_map = {}
@@ -613,6 +734,75 @@ async def execute_copilot_tool(
             if total_atts > 0:
                 summary += f"（含 {total_atts} 个附件，可调用 inspect_attachment 解析）"
             return {"matched_count": len(email_records), "emails": email_records}, referenced_emails, summary
+
+        elif name == "read_email_detail":
+            email_id = str(args.get("email_id") or "").strip()
+            max_chars = int(args.get("max_chars") or 4000)
+            if not email_id:
+                return {"error": "缺少必需的邮件 ID (email_id)"}, [], "读取失败：缺少 email_id"
+
+            cur = await db.execute(f"""
+                SELECT id, account_id, thread_id, subject, from_name, from_email, 
+                       to_emails, cc_emails, date_timestamp, date_str, snippet, body_text
+                FROM emails
+                WHERE {acc_filter} (id = ? OR id LIKE ?)
+                LIMIT 1
+            """, acc_params + [email_id, f"%{email_id}%"])
+            email_row = await cur.fetchone()
+
+            if not email_row:
+                return {
+                    "status": "not_found",
+                    "message": f"未在本地邮件库中检索到 ID 为 '{email_id}' 的邮件"
+                }, [], f"未找到邮件: {email_id}"
+
+            em = dict(email_row)
+            ref_info = {
+                "id": em["id"],
+                "subject": em["subject"] or "(无主题)",
+                "from": f"{em['from_name']} <{em['from_email']}>" if em['from_name'] else em['from_email'],
+                "date": em["date_str"] or ""
+            }
+            referenced_emails.append(ref_info)
+
+            # Retrieve attachments for this email
+            att_cur = await db.execute("""
+                SELECT id, filename, file_size, category, mime_type
+                FROM attachments
+                WHERE email_id = ?
+            """, (em["id"],))
+            att_rows = await att_cur.fetchall()
+            attachments = [
+                {
+                    "id": a["id"],
+                    "filename": a["filename"],
+                    "category": a["category"] or "other",
+                    "size_kb": round((a["file_size"] or 0) / 1024, 1)
+                }
+                for a in att_rows
+            ]
+
+            full_body = (em["body_text"] or em["snippet"] or "").strip()
+            is_truncated = False
+            if len(full_body) > max_chars:
+                full_body = full_body[:max_chars] + f"\n... [正文较长，已截取前 {max_chars} 字符]"
+                is_truncated = True
+
+            result = {
+                "status": "success",
+                "email_id": em["id"],
+                "thread_id": em.get("thread_id"),
+                "subject": em["subject"] or "(无主题)",
+                "from": ref_info["from"],
+                "to": em["to_emails"] or "",
+                "cc": em["cc_emails"] or "",
+                "date": em["date_str"] or "",
+                "body": full_body,
+                "is_truncated": is_truncated,
+                "attachments": attachments
+            }
+            summary = f"成功读取邮件全文详情: 《{em['subject'] or '无主题'}》（{len(full_body)} 字符，含 {len(attachments)} 个附件）"
+            return result, referenced_emails, summary
 
         elif name == "inspect_attachment":
             att_id = (args.get("attachment_id") or "").strip()

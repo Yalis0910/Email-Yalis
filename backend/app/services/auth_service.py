@@ -80,10 +80,17 @@ DEFAULT_USER_GROUPS = [
     }
 ]
 
+_jwt_secret_cache: Optional[str] = None
+_user_profile_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
 def _get_or_create_jwt_secret_sync(conn: sqlite3.Connection) -> str:
+    global _jwt_secret_cache
+    if _jwt_secret_cache:
+        return _jwt_secret_cache
     cur = conn.execute("SELECT value FROM system_settings WHERE key = 'jwt_secret'")
     row = cur.fetchone()
     if row and row[0]:
+        _jwt_secret_cache = row[0]
         return row[0]
     secret = secrets.token_hex(32)
     conn.execute(
@@ -91,13 +98,18 @@ def _get_or_create_jwt_secret_sync(conn: sqlite3.Connection) -> str:
         (secret,)
     )
     conn.commit()
+    _jwt_secret_cache = secret
     return secret
 
 async def _get_or_create_jwt_secret() -> str:
+    global _jwt_secret_cache
+    if _jwt_secret_cache:
+        return _jwt_secret_cache
     async with get_db() as db:
         async with db.execute("SELECT value FROM system_settings WHERE key = 'jwt_secret'") as cur:
             row = await cur.fetchone()
             if row and row[0]:
+                _jwt_secret_cache = row[0]
                 return row[0]
         secret = secrets.token_hex(32)
         await db.execute(
@@ -105,6 +117,7 @@ async def _get_or_create_jwt_secret() -> str:
             (secret,)
         )
         await db.commit()
+        _jwt_secret_cache = secret
         return secret
 
 class AuthService:
@@ -239,8 +252,23 @@ class AuthService:
         conn.commit()
 
     @staticmethod
-    async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch complete user profile including group, permissions, and authorized mailboxes"""
+    def invalidate_user_cache(user_id: Optional[str] = None):
+        """Invalidates in-memory user profile cache (call on user/permission updates)"""
+        global _user_profile_cache
+        if user_id:
+            _user_profile_cache.pop(user_id, None)
+        else:
+            _user_profile_cache.clear()
+
+    @staticmethod
+    async def get_user_profile(user_id: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        """Fetch complete user profile including group, permissions, and authorized mailboxes with short memory TTL cache"""
+        global _user_profile_cache
+        if use_cache and user_id in _user_profile_cache:
+            ts, cached_profile = _user_profile_cache[user_id]
+            if time.time() - ts < 15.0:
+                return cached_profile
+
         async with get_db() as db:
             async with db.execute("""
                 SELECT u.id, u.username, u.display_name, u.group_id, u.is_superadmin, u.is_active,
@@ -298,7 +326,7 @@ class AuthService:
 
                 authorized_accounts = list(acc_set)
 
-            return {
+            profile = {
                 "id": user["id"],
                 "username": user["username"],
                 "display_name": user["display_name"] or user["username"],
@@ -311,6 +339,8 @@ class AuthService:
                 "authorized_accounts": authorized_accounts,
                 "created_at": user["created_at"]
             }
+            _user_profile_cache[user_id] = (time.time(), profile)
+            return profile
 
     @staticmethod
     async def authenticate_user(username: str, password: str) -> Optional[Dict[str, Any]]:

@@ -73,12 +73,16 @@ async def get_digital_assets(
 async def get_subscriptions(
     account_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    page: Optional[int] = Query(None, ge=1),
+    limit: Optional[int] = Query(None, ge=1, le=200),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     check_account_access(account_id, current_user)
     authorized = get_authorized_account_ids(current_user)
 
     if authorized is not None and not authorized and not account_id:
+        if page is not None or limit is not None:
+            return {"items": [], "total": 0, "page": page or 1, "limit": limit or 30}
         return []
 
     conditions = []
@@ -99,15 +103,41 @@ async def get_subscriptions(
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     async with get_db() as db:
-        query = f"""
-            SELECT id, account_id, service_name, currency, amount, cycle, invoice_date, source_email_id
-            FROM subscriptions
-            {where_clause}
-            ORDER BY invoice_date DESC
-        """
-        async with db.execute(query, params) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
+        if page is not None or limit is not None:
+            async with db.execute(f"SELECT COUNT(*) FROM subscriptions {where_clause}", params) as cur:
+                total = (await cur.fetchone())[0]
+
+            p = page or 1
+            l = limit or 30
+            offset = (p - 1) * l
+
+            query = f"""
+                SELECT id, account_id, service_name, currency, amount, cycle, invoice_date, source_email_id
+                FROM subscriptions
+                {where_clause}
+                ORDER BY invoice_date DESC
+                LIMIT ? OFFSET ?
+            """
+            async with db.execute(query, (*params, l, offset)) as cur:
+                rows = await cur.fetchall()
+                items = [dict(r) for r in rows]
+
+            return {
+                "items": items,
+                "total": total,
+                "page": p,
+                "limit": l
+            }
+        else:
+            query = f"""
+                SELECT id, account_id, service_name, currency, amount, cycle, invoice_date, source_email_id
+                FROM subscriptions
+                {where_clause}
+                ORDER BY invoice_date DESC
+            """
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
 
 @router.get("/categories")
 async def get_digital_asset_categories(

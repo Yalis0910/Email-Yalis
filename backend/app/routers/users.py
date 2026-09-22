@@ -90,6 +90,7 @@ async def change_password(
             (new_hash, new_salt, current_user["id"])
         )
         await db.commit()
+        AuthService.invalidate_user_cache(current_user["id"])
 
     return {"status": "success", "message": "密码修改成功，请使用新密码"}
 
@@ -196,6 +197,7 @@ async def update_user(
                 )
 
         await db.commit()
+        AuthService.invalidate_user_cache(user_id)
 
     return {"status": "success", "message": "用户信息已更新"}
 
@@ -219,6 +221,7 @@ async def reset_user_password(
             WHERE id = ?
         """, (new_hash, new_salt, user_id))
         await db.commit()
+        AuthService.invalidate_user_cache(user_id)
 
     return {"status": "success", "message": "用户密码已重置"}
 
@@ -240,6 +243,7 @@ async def delete_user(
 
         await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
         await db.commit()
+        AuthService.invalidate_user_cache(user_id)
 
     return {"status": "success", "message": "用户已成功删除"}
 
@@ -313,6 +317,7 @@ async def create_group(
             )
 
         await db.commit()
+        AuthService.invalidate_user_cache()
 
     return {"status": "success", "message": f"管理组 [{name}] 创建成功", "group_id": group_id}
 
@@ -354,6 +359,7 @@ async def update_group(
             )
 
         await db.commit()
+        AuthService.invalidate_user_cache()
 
     return {"status": "success", "message": "管理组配置已更新"}
 
@@ -372,5 +378,6 @@ async def delete_group(
 
         await db.execute("DELETE FROM user_groups WHERE id = ?", (group_id,))
         await db.commit()
+        AuthService.invalidate_user_cache()
 
     return {"status": "success", "message": "管理组已删除，组内成员已变更为未分配组"}

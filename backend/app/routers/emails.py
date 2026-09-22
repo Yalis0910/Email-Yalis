@@ -82,9 +82,9 @@ async def list_or_search_emails(
             conditions = ["email_fts MATCH ?"]
             params = [clean_q]
 
-            if isinstance(account_id, str) and account_id:
+            if clean_account_id:
                 conditions.append("e.account_id = ?")
-                params.append(account_id)
+                params.append(clean_account_id)
             elif authorized is not None:
                 placeholders = ",".join("?" for _ in authorized)
                 conditions.append(f"e.account_id IN ({placeholders})")
@@ -182,7 +182,7 @@ async def list_or_search_emails(
                             ORDER BY e.date_timestamp DESC
                             LIMIT ? OFFSET ?
                         """
-                    async with db.execute(query_sql, (*params, limit, offset)) as cur:
+                    async with db.execute(query_sql, (*params, lim, offset)) as cur:
                         rows = await cur.fetchall()
                         items = [dict(r) for r in rows]
                     fts_success = True
@@ -196,9 +196,9 @@ async def list_or_search_emails(
                 like_conds = ["(e.subject LIKE ? OR e.from_email LIKE ? OR e.from_name LIKE ? OR e.snippet LIKE ? OR e.body_text LIKE ?)"]
                 like_pat = f"%{q.strip()}%"
                 like_params = [like_pat, like_pat, like_pat, like_pat, like_pat]
-                if isinstance(account_id, str) and account_id:
+                if clean_account_id:
                     like_conds.append("e.account_id = ?")
-                    like_params.append(account_id)
+                    like_params.append(clean_account_id)
                 elif authorized is not None:
                     placeholders = ",".join("?" for _ in authorized)
                     like_conds.append(f"e.account_id IN ({placeholders})")
@@ -283,7 +283,7 @@ async def list_or_search_emails(
                         ORDER BY e.date_timestamp DESC
                         LIMIT ? OFFSET ?
                     """
-                async with db.execute(query_sql, (*like_params, limit, offset)) as cur:
+                async with db.execute(query_sql, (*like_params, lim, offset)) as cur:
                     rows = await cur.fetchall()
                     items = [dict(r) for r in rows]
 
@@ -291,9 +291,9 @@ async def list_or_search_emails(
             # Standard query (no search keyword)
             conditions = []
             params = []
-            if isinstance(account_id, str) and account_id:
+            if clean_account_id:
                 conditions.append("account_id = ?")
-                params.append(account_id)
+                params.append(clean_account_id)
             elif authorized is not None:
                 placeholders = ",".join("?" for _ in authorized)
                 conditions.append(f"account_id IN ({placeholders})")
@@ -372,7 +372,7 @@ async def list_or_search_emails(
             async with db.execute(count_sql, params) as cur:
                 total = (await cur.fetchone())[0]
 
-            async with db.execute(query_sql, (*params, limit, offset)) as cur:
+            async with db.execute(query_sql, (*params, lim, offset)) as cur:
                 rows = await cur.fetchall()
                 items = [dict(r) for r in rows]
 
@@ -386,8 +386,8 @@ async def list_or_search_emails(
     return {
         "items": items,
         "total": total,
-        "page": page,
-        "limit": limit
+        "page": p,
+        "limit": lim
     }
 
 @router.get("/threads/{thread_id}")
